@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "foundry-rag"
+version = "0.1.0"
+description = "A small, testable Foundry Local RAG starter"
+requires-python = ">=3.10"
+dependencies = [
+    "foundry-local-sdk-winml>=1.2.3; sys_platform == 'win32'",
+    "foundry-local-sdk>=1.2.3; sys_platform != 'win32'",
+    "pypdf>=6.0",
+    "tkinterdnd2>=0.4.4",
+]
+
+[project.optional-dependencies]
+ocr = ["pymupdf>=1.24", "pytesseract>=0.3.13", "Pillow>=10"]
+
+[project.scripts]
+foundry-rag = "foundry_rag.cli:main"
+foundry-rag-app = "foundry_rag.gui:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+
