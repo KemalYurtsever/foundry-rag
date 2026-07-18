@@ -1,4 +1,4 @@
-# Foundry Local RAG starter
+# Foundry Local RAG 
 
 This is a local, keyless RAG project with structure-aware ingestion, recursive chunking, Unicode-aware BM25 retrieval, optional Foundry Local embeddings, reciprocal-rank fusion, semantic and intent reranking, confidence-based abstention, grounded citations, and regression evaluation. Extracted sections, file hashes, model metadata, and embeddings are persisted transactionally in SQLite.
 
