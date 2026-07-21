@@ -15,33 +15,35 @@ from tkinter.scrolledtext import ScrolledText
 
 from tkinterdnd2 import DND_FILES, TkinterDnD
 
+from .app_settings import AppSettings, load_app_settings, save_app_settings
 from .documents import _SUPPORTED_SUFFIXES
 from .embeddings import optional_foundry_embedder
-from .pipeline import Answer, RAGPipeline
+from .pipeline import Answer, RAGPipeline, flexible_answer_text
+from .theme import apply_window_frame, theme_palette
+from .ui_support import add_tooltip
 
 LOGGER = logging.getLogger(__name__)
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DOCUMENTS = PROJECT_ROOT / "data" / "documents"
 DEFAULT_CACHE = PROJECT_ROOT / ".rag_cache"
 
-THEME = {
-    "bg": "#0f141a",
-    "panel": "#151b23",
-    "panel_raised": "#1b2430",
-    "field": "#0b1117",
-    "border": "#2b3645",
-    "text": "#e6edf3",
-    "muted": "#9aa7b4",
-    "accent": "#6aa6ff",
-    "accent_hover": "#8ab8ff",
-    "success": "#7ee787",
-    "warning": "#d29922",
-    "danger": "#ff7b72",
-    "selection": "#1f6feb",
-    "status_busy": "#24364d",
-    "status_ready": "#183322",
-    "status_error": "#3d1f24",
+RETRIEVAL_PRESETS: dict[str, tuple[str, int]] = {
+    "Precise": ("2", 0),
+    "Balanced": ("Auto", 2),
+    "Thorough": ("6", 3),
 }
+
+
+def _style_scrolled_text(widget: ScrolledText) -> None:
+    widget.vbar.configure(
+        background=THEME["panel_raised"],
+        activebackground=THEME["border"],
+        troughcolor=THEME["field"],
+        borderwidth=0,
+        highlightthickness=0,
+    )
+
+THEME = theme_palette("Dark")
 
 def import_documents(paths: tuple[str, ...], destination: Path) -> list[Path]:
     """Copy supported user files into the managed document directory."""
@@ -68,32 +70,56 @@ class RAGDesktopApp(TkinterDnD.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("Foundry Local RAG")
-        self.geometry("1100x720")
+        self.settings_path = DEFAULT_CACHE / "app-settings.json"
+        saved = load_app_settings(self.settings_path)
+        THEME.clear()
+        THEME.update(theme_palette(saved.theme))
+        try:
+            self.geometry(saved.geometry)
+        except tk.TclError:
+            self.geometry("1100x720")
         self.minsize(820, 560)
+        self.state("zoomed")
         self.documents_dir = DEFAULT_DOCUMENTS
         self.cache_dir = DEFAULT_CACHE
         self.pipeline: RAGPipeline | None = None
         self.pipeline_lock = threading.Lock()
         self.busy = False
-        self.sidebar_visible = False
+        self.sidebar_visible = saved.sidebar_visible
         self.sidebar_width = 280
         self.sidebar_animation: str | None = None
         self.source_link_counter = 0
         self.source_link_payloads: dict[str, tuple[str, Answer]] = {}
         self.last_answer: Answer | None = None
-        self.top_k_var = tk.StringVar(value="Auto")
-        self.neighbor_window_var = tk.IntVar(value=2)
-        self.use_embeddings_var = tk.BooleanVar(value=True)
-        self.show_diagnostics_var = tk.BooleanVar(value=False)
-        self.answer_mode_var = tk.StringVar(value="Strict")
+        self.last_evidence_answer: Answer | None = None
+        self.retrieval_preset_var = tk.StringVar(value=saved.retrieval_preset)
+        self.top_k_var = tk.StringVar(value=saved.top_k)
+        self.neighbor_window_var = tk.IntVar(value=saved.neighbors)
+        self.use_embeddings_var = tk.BooleanVar(value=saved.use_embeddings)
+        self.show_diagnostics_var = tk.BooleanVar(value=saved.show_diagnostics)
+        self.answer_mode_var = tk.StringVar(value=saved.answer_mode)
+        self.theme_var = tk.StringVar(value=saved.theme)
+        self.document_filter_var = tk.StringVar()
+        self.document_sort_var = tk.StringVar(value=saved.file_sort)
+        self.document_paths: list[Path] = []
+        self.indexed_file_signatures: dict[str, tuple[int, int]] = {}
+        self.document_chunk_counts: Counter[str] = Counter()
+        self.document_page_counts: dict[str, int] = {}
+        self.index_cancel_event = threading.Event()
         self._configure_style()
         self._build_layout()
+        self._add_tooltips()
+        self._bind_shortcuts()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._refresh_document_list()
+        if self.sidebar_visible:
+            self.sidebar.grid()
+            self.sidebar.configure(width=self.sidebar_width)
+            self.sidebar_toggle.configure(text="Hide knowledge files")
         self._rebuild_index("Loading documents…")
 
     def _configure_style(self) -> None:
-        self.configure(background=THEME["bg"])
+        apply_window_frame(self, THEME, self.theme_var.get())
         style = ttk.Style(self)
         if "clam" in style.theme_names():
             style.theme_use("clam")
@@ -108,11 +134,72 @@ class RAGDesktopApp(TkinterDnD.Tk):
         style.configure("Subtle.TLabel", background=THEME["bg"], foreground=THEME["muted"])
         style.configure("TLabelframe", background=THEME["panel"], foreground=THEME["text"], bordercolor=THEME["border"], relief=tk.SOLID)
         style.configure("TLabelframe.Label", background=THEME["panel"], foreground=THEME["muted"], font=("Segoe UI", 9, "bold"))
-        style.configure("TButton", background=THEME["panel_raised"], foreground=THEME["text"], bordercolor=THEME["border"], focusthickness=1, focuscolor=THEME["accent"], padding=(10, 6))
+        style.configure(
+            "TButton",
+            background=THEME["panel_raised"],
+            foreground=THEME["text"],
+            borderwidth=0,
+            relief=tk.FLAT,
+            focusthickness=1,
+            focuscolor=THEME["accent"],
+            padding=(14, 8),
+            font=("Segoe UI", 9, "bold"),
+        )
         style.map(
             "TButton",
-            background=[("active", THEME["border"]), ("disabled", THEME["panel"])],
+            background=[("pressed", THEME["field"]), ("active", THEME["border"]), ("disabled", THEME["panel"])],
             foreground=[("active", THEME["text"]), ("disabled", "#637083")],
+        )
+        style.configure(
+            "Accent.TButton",
+            background=THEME["accent"],
+            foreground="#ffffff",
+            borderwidth=0,
+            relief=tk.FLAT,
+            focusthickness=1,
+            focuscolor=THEME["accent_hover"],
+            padding=(16, 9),
+            font=("Segoe UI", 9, "bold"),
+        )
+        style.map(
+            "Accent.TButton",
+            background=[
+                ("pressed", THEME["accent_pressed"]),
+                ("active", THEME["accent_hover"]),
+                ("disabled", THEME["border"]),
+            ],
+            foreground=[("disabled", THEME["muted"])],
+        )
+        style.configure(
+            "Danger.TButton",
+            background="#3a1d29",
+            foreground=THEME["danger"],
+            borderwidth=0,
+            relief=tk.FLAT,
+            focusthickness=1,
+            focuscolor=THEME["danger"],
+            padding=(14, 8),
+            font=("Segoe UI", 9, "bold"),
+        )
+        style.map(
+            "Danger.TButton",
+            background=[("pressed", "#541d2d"), ("active", "#49202d"), ("disabled", THEME["panel"])],
+            foreground=[("active", "#fda4af"), ("disabled", "#637083")],
+        )
+        style.configure(
+            "Theme.TButton",
+            background=THEME["panel_raised"],
+            foreground=THEME["text"],
+            borderwidth=0,
+            relief=tk.FLAT,
+            focusthickness=1,
+            focuscolor=THEME["accent"],
+            padding=(9, 5),
+            font=("Segoe UI Symbol", 14),
+        )
+        style.map(
+            "Theme.TButton",
+            background=[("pressed", THEME["field"]), ("active", THEME["border"])],
         )
         style.configure("TEntry", fieldbackground=THEME["field"], foreground=THEME["text"], bordercolor=THEME["border"], insertcolor=THEME["text"])
         style.configure("TSpinbox", fieldbackground=THEME["field"], foreground=THEME["text"], bordercolor=THEME["border"], arrowsize=13)
@@ -121,6 +208,9 @@ class RAGDesktopApp(TkinterDnD.Tk):
         style.configure("TCheckbutton", background=THEME["panel"], foreground=THEME["text"], focuscolor=THEME["accent"])
         style.map("TCheckbutton", background=[("active", THEME["panel"])], foreground=[("active", THEME["text"])])
         style.configure("Vertical.TScrollbar", background=THEME["panel_raised"], troughcolor=THEME["field"], bordercolor=THEME["bg"], arrowcolor=THEME["muted"])
+        style.configure("Treeview", background=THEME["field"], fieldbackground=THEME["field"], foreground=THEME["text"], rowheight=26, borderwidth=0)
+        style.configure("Treeview.Heading", background=THEME["panel_raised"], foreground=THEME["text"], relief=tk.FLAT, font=("Segoe UI", 9, "bold"))
+        style.map("Treeview", background=[("selected", THEME["selection"])], foreground=[("selected", "#ffffff")])
 
     def _build_layout(self) -> None:
         root = ttk.Frame(self, padding=16, style="TFrame")
@@ -130,10 +220,20 @@ class RAGDesktopApp(TkinterDnD.Tk):
         ttk.Label(root, text="Foundry Local RAG", style="Title.TLabel").grid(
             row=0, column=0, sticky="w", pady=(0, 12)
         )
-        self.sidebar_toggle = ttk.Button(
-            root, text="Show knowledge files", command=self._toggle_knowledge_panel
+        header_actions = ttk.Frame(root)
+        header_actions.grid(row=0, column=1, sticky="e", pady=(0, 12))
+        self.theme_button = ttk.Button(
+            header_actions,
+            text="☀" if self.theme_var.get() == "Dark" else "☾",
+            command=self._toggle_theme,
+            style="Theme.TButton",
+            width=2,
         )
-        self.sidebar_toggle.grid(row=0, column=1, sticky="e", pady=(0, 12))
+        self.theme_button.grid(row=0, column=0, sticky="e", padx=(0, 8))
+        self.sidebar_toggle = ttk.Button(
+            header_actions, text="Show knowledge files", command=self._toggle_knowledge_panel
+        )
+        self.sidebar_toggle.grid(row=0, column=1, sticky="e")
 
         self.sidebar = ttk.LabelFrame(root, text="Knowledge files", padding=10)
         self.sidebar.configure(width=self.sidebar_width)
@@ -141,8 +241,10 @@ class RAGDesktopApp(TkinterDnD.Tk):
         self.sidebar.grid(row=1, column=0, sticky="nsew", padx=(0, 12))
         self.sidebar.rowconfigure(0, weight=1)
         self.sidebar.columnconfigure(0, weight=1)
-        self.document_list = tk.Listbox(self.sidebar, width=34, activestyle="none", background=THEME["field"], foreground=THEME["text"], selectbackground=THEME["selection"], selectforeground="#ffffff", highlightthickness=1, highlightbackground=THEME["border"], highlightcolor=THEME["accent"], relief=tk.FLAT, borderwidth=0)
+        self.document_list = tk.Listbox(self.sidebar, width=34, selectmode=tk.EXTENDED, activestyle="none", background=THEME["field"], foreground=THEME["text"], selectbackground=THEME["selection"], selectforeground="#ffffff", highlightthickness=1, highlightbackground=THEME["border"], highlightcolor=THEME["accent"], relief=tk.FLAT, borderwidth=0)
         self.document_list.grid(row=0, column=0, sticky="nsew")
+        self.document_list.bind("<Double-Button-1>", self._open_selected_document)
+        self.document_list.bind("<<ListboxSelect>>", self._update_document_metadata)
         scrollbar = ttk.Scrollbar(
             self.sidebar, orient=tk.VERTICAL, command=self.document_list.yview
         )
@@ -164,13 +266,14 @@ class RAGDesktopApp(TkinterDnD.Tk):
             drop_target.dnd_bind("<<DropLeave>>", self._on_drop_leave)
             drop_target.dnd_bind("<<Drop>>", self._on_files_dropped)
         self.import_button = ttk.Button(
-            self.sidebar, text="Import files", command=self._choose_documents
+            self.sidebar, text="Import files", command=self._choose_documents, style="Accent.TButton"
         )
         self.import_button.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(0, 4))
         self.remove_button = ttk.Button(
             self.sidebar,
             text="Remove selected file",
             command=self._remove_selected_document,
+            style="Danger.TButton",
         )
         self.remove_button.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(0, 4))
         self.refresh_selected_button = ttk.Button(
@@ -183,21 +286,61 @@ class RAGDesktopApp(TkinterDnD.Tk):
             self.sidebar, text="Rebuild all files", command=self._rebuild_index
         )
         self.rebuild_button.grid(row=5, column=0, columnspan=2, sticky="ew")
+        library_tools = ttk.Frame(self.sidebar, style="Panel.TFrame")
+        library_tools.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        library_tools.columnconfigure(0, weight=1)
+        search_entry = ttk.Entry(library_tools, textvariable=self.document_filter_var)
+        search_entry.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        sort_box = ttk.Combobox(
+            library_tools,
+            textvariable=self.document_sort_var,
+            values=("Name", "Newest", "Largest", "Type"),
+            state="readonly",
+            width=8,
+        )
+        sort_box.grid(row=0, column=1, sticky="e")
+        self.document_filter_var.trace_add("write", lambda *_args: self._refresh_document_list())
+        sort_box.bind("<<ComboboxSelected>>", lambda _event: self._refresh_document_list())
+        self.document_metadata = ttk.Label(
+            self.sidebar,
+            text="Search files or select one for details",
+            style="Subtle.TLabel",
+            wraplength=245,
+        )
+        self.document_metadata.grid(row=7, column=0, columnspan=2, sticky="w", pady=(5, 0))
         ttk.Label(
             self.sidebar,
-            text="Supported: TXT, MD, PDF, DOCX, DOC",
+            text="Supported files\nTXT · MD · PDF · DOCX · DOC · PPTX · PPT",
             style="Subtle.TLabel",
-        ).grid(row=6, column=0, columnspan=2, sticky="w", pady=(8, 0))
+            wraplength=230,
+            justify=tk.LEFT,
+        ).grid(row=8, column=0, columnspan=2, sticky="ew", pady=(5, 0))
 
         settings = ttk.LabelFrame(self.sidebar, text="Retrieval settings", padding=8)
-        settings.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        settings.grid(row=9, column=0, columnspan=2, sticky="ew", pady=(10, 0))
         settings.columnconfigure(1, weight=1)
-        ttk.Label(settings, text="Top K").grid(row=0, column=0, sticky="w", pady=(0, 4))
-        ttk.Entry(settings, textvariable=self.top_k_var, width=8).grid(row=0, column=1, sticky="ew", pady=(0, 4))
-        ttk.Label(settings, text="Neighbors").grid(row=1, column=0, sticky="w", pady=(0, 4))
-        ttk.Spinbox(settings, from_=0, to=5, textvariable=self.neighbor_window_var, width=6).grid(row=1, column=1, sticky="ew", pady=(0, 4))
-        ttk.Checkbutton(settings, text="Use embeddings", variable=self.use_embeddings_var).grid(row=2, column=0, columnspan=2, sticky="w")
-        ttk.Label(settings, text="Answer mode").grid(row=3, column=0, sticky="w", pady=(4, 4))
+        self.preset_label = ttk.Label(settings, text="Preset")
+        self.preset_label.grid(row=0, column=0, sticky="w", pady=(0, 4))
+        self.retrieval_preset_box = ttk.Combobox(
+            settings,
+            textvariable=self.retrieval_preset_var,
+            values=(*RETRIEVAL_PRESETS, "Custom"),
+            state="readonly",
+            width=10,
+        )
+        self.retrieval_preset_box.grid(row=0, column=1, sticky="ew", pady=(0, 4))
+        self.retrieval_preset_box.bind("<<ComboboxSelected>>", self._apply_retrieval_preset)
+        self.top_k_label = ttk.Label(settings, text="Top K")
+        self.top_k_label.grid(row=1, column=0, sticky="w", pady=(0, 4))
+        self.top_k_entry = ttk.Entry(settings, textvariable=self.top_k_var, width=8)
+        self.top_k_entry.grid(row=1, column=1, sticky="ew", pady=(0, 4))
+        self.neighbors_label = ttk.Label(settings, text="Neighbors")
+        self.neighbors_label.grid(row=2, column=0, sticky="w", pady=(0, 4))
+        self.neighbor_spinbox = ttk.Spinbox(settings, from_=0, to=5, textvariable=self.neighbor_window_var, width=6)
+        self.neighbor_spinbox.grid(row=2, column=1, sticky="ew", pady=(0, 4))
+        ttk.Checkbutton(settings, text="Use embeddings", variable=self.use_embeddings_var).grid(row=3, column=0, columnspan=2, sticky="w")
+        self.answer_mode_label = ttk.Label(settings, text="Answer mode")
+        self.answer_mode_label.grid(row=4, column=0, sticky="w", pady=(4, 4))
         mode_box = ttk.Combobox(
             settings,
             textvariable=self.answer_mode_var,
@@ -205,9 +348,16 @@ class RAGDesktopApp(TkinterDnD.Tk):
             state="readonly",
             width=10,
         )
-        mode_box.grid(row=3, column=1, sticky="ew", pady=(4, 4))
-        ttk.Checkbutton(settings, text="Show diagnostics", variable=self.show_diagnostics_var).grid(row=4, column=0, columnspan=2, sticky="w")
-        ttk.Button(settings, text="Apply and rebuild", command=lambda: self._rebuild_index("Applying settings...")).grid(row=5, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        mode_box.grid(row=4, column=1, sticky="ew", pady=(4, 4))
+        ttk.Checkbutton(settings, text="Show diagnostics", variable=self.show_diagnostics_var).grid(row=5, column=0, columnspan=2, sticky="w")
+        for combo_box in (self.retrieval_preset_box, sort_box, mode_box):
+            combo_box.bind(
+                "<<ComboboxSelected>>",
+                self._clear_combobox_highlight,
+                add="+",
+            )
+        ttk.Button(settings, text="Apply and rebuild", command=lambda: self._rebuild_index("Applying settings..."), style="Accent.TButton").grid(row=6, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        self._apply_retrieval_preset()
         self.sidebar.grid_remove()
         chat = ttk.Frame(root)
         chat.grid(row=1, column=1, sticky="nsew")
@@ -220,6 +370,13 @@ class RAGDesktopApp(TkinterDnD.Tk):
         self.clear_chat_button.grid(row=0, column=1, sticky="e", padx=(0, 6))
         self.copy_answer_button = ttk.Button(toolbar, text="Copy answer", command=self._copy_last_answer)
         self.copy_answer_button.grid(row=0, column=2, sticky="e")
+        self.inspect_retrieval_button = ttk.Button(
+            toolbar,
+            text="Inspect retrieval",
+            command=self._show_retrieval_inspector,
+            state=tk.DISABLED,
+        )
+        self.inspect_retrieval_button.grid(row=0, column=3, sticky="e", padx=(6, 0))
 
         self.transcript = ScrolledText(
             chat,
@@ -240,6 +397,7 @@ class RAGDesktopApp(TkinterDnD.Tk):
             highlightcolor=THEME["accent"],
         )
         self.transcript.grid(row=1, column=0, columnspan=2, sticky="nsew")
+        _style_scrolled_text(self.transcript)
         self.transcript.tag_configure("user", foreground=THEME["accent"], font=("Segoe UI", 11, "bold"))
         self.transcript.tag_configure("assistant", foreground=THEME["success"], font=("Segoe UI", 11, "bold"))
         self.transcript.tag_configure("sources", foreground=THEME["muted"], font=("Segoe UI", 9))
@@ -250,7 +408,7 @@ class RAGDesktopApp(TkinterDnD.Tk):
         self.question = tk.Text(chat, height=3, wrap=tk.WORD, font=("Segoe UI", 11), background=THEME["field"], foreground=THEME["text"], insertbackground=THEME["text"], selectbackground=THEME["selection"], selectforeground="#ffffff", relief=tk.FLAT, borderwidth=0, highlightthickness=1, highlightbackground=THEME["border"], highlightcolor=THEME["accent"], padx=10, pady=8)
         self.question.grid(row=2, column=0, sticky="ew", pady=(10, 0), padx=(0, 8))
         self.question.bind("<Return>", self._send_from_event)
-        self.send_button = ttk.Button(chat, text="Send", command=self._send_question)
+        self.send_button = ttk.Button(chat, text="Send", command=self._send_question, style="Accent.TButton")
         self.send_button.grid(row=2, column=1, sticky="nsew", pady=(10, 0))
 
         self.status = tk.StringVar(value="STARTING")
@@ -265,6 +423,36 @@ class RAGDesktopApp(TkinterDnD.Tk):
             anchor="w",
         )
         self.status_label.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        self.index_activity = ttk.Frame(root)
+        self.index_activity.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        self.index_activity.columnconfigure(0, weight=1)
+        self.index_progress = ttk.Progressbar(self.index_activity, mode="indeterminate")
+        self.index_progress.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        self.cancel_index_button = ttk.Button(
+            self.index_activity, text="Cancel indexing", command=self._cancel_indexing
+        )
+        self.cancel_index_button.grid(row=0, column=1, sticky="e")
+        self.index_activity.grid_remove()
+
+    def _add_tooltips(self) -> None:
+        add_tooltip(self.preset_label, "Choose a safe retrieval profile. Custom unlocks the detailed controls.")
+        add_tooltip(self.top_k_label, "Number of initial matching chunks. Auto adapts to the collection and model.")
+        add_tooltip(self.neighbors_label, "Nearby chunks added around each direct hit. Lower values reduce unrelated context.")
+        add_tooltip(self.answer_mode_label, "Strict keeps source wording. Flexible adapts grounded evidence to the question type.")
+        add_tooltip(self.theme_button, "Switch between dark and light mode.")
+        add_tooltip(self.inspect_retrieval_button, "Inspect ranking signals and the full text of every retrieved chunk.")
+
+    def _bind_shortcuts(self) -> None:
+        self.bind_all("<Control-o>", lambda _event: self._choose_documents())
+        self.bind_all("<Control-l>", lambda _event: self.question.focus_set())
+        self.bind_all("<Control-k>", lambda _event: self._toggle_knowledge_panel())
+        self.bind_all("<Control-Shift-I>", lambda _event: self._show_retrieval_inspector())
+        self.bind_all("<F5>", lambda _event: self._rebuild_index())
+        self.bind_all(
+            "<Escape>",
+            lambda _event: self._cancel_indexing() if self.index_activity.winfo_ismapped() else None,
+        )
+        self.document_list.bind("<Delete>", lambda _event: self._remove_selected_document())
 
     def _toggle_knowledge_panel(self) -> None:
         opening = not self.sidebar_visible
@@ -295,18 +483,60 @@ class RAGDesktopApp(TkinterDnD.Tk):
     def _refresh_document_list(self) -> None:
         self.document_list.delete(0, tk.END)
         self.documents_dir.mkdir(parents=True, exist_ok=True)
-        files = sorted(
+        files = [
             path.relative_to(self.documents_dir) for path in self.documents_dir.rglob("*")
             if path.is_file() and path.suffix.casefold() in _SUPPORTED_SUFFIXES
-        )
+        ]
+        query = self.document_filter_var.get().strip().casefold()
+        if query:
+            files = [path for path in files if query in str(path).casefold()]
+        sort_mode = self.document_sort_var.get()
+        if sort_mode == "Newest":
+            files.sort(key=lambda path: (self.documents_dir / path).stat().st_mtime, reverse=True)
+        elif sort_mode == "Largest":
+            files.sort(key=lambda path: (self.documents_dir / path).stat().st_size, reverse=True)
+        elif sort_mode == "Type":
+            files.sort(key=lambda path: (path.suffix.casefold(), str(path).casefold()))
+        else:
+            files.sort(key=lambda path: str(path).casefold())
+        self.document_paths = files
         for path in files:
             self.document_list.insert(tk.END, str(path))
+        if hasattr(self, "document_metadata"):
+            self.document_metadata.configure(text=f"{len(files)} knowledge file(s)")
+
+    def _update_document_metadata(self, _event: tk.Event | None = None) -> None:
+        selection = self.document_list.curselection()
+        if not selection:
+            self.document_metadata.configure(text=f"{len(self.document_paths)} knowledge file(s)")
+            return
+        if len(selection) > 1:
+            total = sum(
+                (self.documents_dir / Path(self.document_list.get(index))).stat().st_size
+                for index in selection
+            )
+            self.document_metadata.configure(
+                text=f"{len(selection)} selected - {total / 1024:.1f} KB total"
+            )
+            return
+        relative = Path(self.document_list.get(selection[0]))
+        target = self.documents_dir / relative
+        stat = target.stat()
+        source = relative.as_posix()
+        status = "Indexed" if source in self.indexed_file_signatures else "Pending index"
+        chunks = self.document_chunk_counts.get(source, 0)
+        pages = self.document_page_counts.get(source, 0)
+        unit = "slides" if relative.suffix.casefold() in {".ppt", ".pptx"} else "pages"
+        extraction = f"{chunks} chunks" + (f", {pages} {unit}" if pages else "")
+        self.document_metadata.configure(
+            text=f"{relative.suffix.upper().lstrip('.')} - {stat.st_size / 1024:.1f} KB - {status} - {extraction}"
+        )
 
     def _choose_documents(self) -> None:
         paths = filedialog.askopenfilenames(
             title="Import knowledge files",
             filetypes=[
-                ("Supported documents", "*.txt *.md *.pdf *.docx *.doc"),
+                ("Supported documents", "*.txt *.md *.pdf *.docx *.doc *.pptx *.ppt"),
                 ("All files", "*.*"),
             ],
         )
@@ -340,6 +570,8 @@ class RAGDesktopApp(TkinterDnD.Tk):
         self.transcript.configure(state=tk.DISABLED)
         self.source_link_payloads.clear()
         self.last_answer = None
+        self.last_evidence_answer = None
+        self.inspect_retrieval_button.configure(state=tk.DISABLED)
 
     def _copy_last_answer(self) -> None:
         if self.last_answer is None or not self.last_answer.text.strip():
@@ -348,6 +580,180 @@ class RAGDesktopApp(TkinterDnD.Tk):
         self.clipboard_clear()
         self.clipboard_append(self.last_answer.text)
         self.status.set("ANSWER COPIED")
+
+    def _show_retrieval_inspector(self) -> None:
+        answer = self.last_evidence_answer
+        if answer is None or not answer.results:
+            messagebox.showinfo("No retrieval", "Ask a question before inspecting retrieval.", parent=self)
+            return
+
+        window = tk.Toplevel(self)
+        apply_window_frame(window, THEME, self.theme_var.get())
+        window.title("Retrieval inspector")
+        window.geometry("980x640")
+        window.minsize(720, 460)
+        window.columnconfigure(0, weight=1)
+        window.rowconfigure(1, weight=3)
+        window.rowconfigure(2, weight=2)
+
+        summary = ttk.Frame(window, padding=(12, 10, 12, 8))
+        summary.grid(row=0, column=0, sticky="ew")
+        summary.columnconfigure(0, weight=1)
+        ttk.Label(summary, text="Retrieved evidence", font=("Segoe UI", 12, "bold")).grid(
+            row=0, column=0, sticky="w"
+        )
+        ttk.Label(
+            summary,
+            text=f"{len(answer.results)} chunks inspected - select a row to view its full text",
+            style="Subtle.TLabel",
+        ).grid(row=1, column=0, sticky="w", pady=(2, 0))
+
+        table_frame = ttk.Frame(window, padding=(12, 0, 12, 8))
+        table_frame.grid(row=1, column=0, sticky="nsew")
+        table_frame.columnconfigure(0, weight=1)
+        table_frame.rowconfigure(0, weight=1)
+        columns = ("rank", "source", "page", "kind", "score", "confidence", "lexical", "semantic")
+        table = ttk.Treeview(table_frame, columns=columns, show="headings", selectmode="browse")
+        headings = {
+            "rank": "#",
+            "source": "Source",
+            "page": "Page / slide",
+            "kind": "Reason",
+            "score": "Score",
+            "confidence": "Confidence",
+            "lexical": "Lexical",
+            "semantic": "Semantic",
+        }
+        widths = {"rank": 42, "source": 230, "page": 55, "kind": 90, "score": 78, "confidence": 90, "lexical": 78, "semantic": 78}
+        for column in columns:
+            table.heading(column, text=headings[column])
+            table.column(column, width=widths[column], anchor="w" if column == "source" else "center")
+        table.grid(row=0, column=0, sticky="nsew")
+        table_scrollbar = ttk.Scrollbar(table_frame, orient=tk.VERTICAL, command=table.yview)
+        table_scrollbar.grid(row=0, column=1, sticky="ns")
+        table.configure(yscrollcommand=table_scrollbar.set)
+
+        detail = ScrolledText(
+            window,
+            wrap=tk.WORD,
+            state=tk.DISABLED,
+            font=("Segoe UI", 10),
+            padx=12,
+            pady=12,
+            background=THEME["field"],
+            foreground=THEME["text"],
+            selectbackground=THEME["selection"],
+            selectforeground="#ffffff",
+            relief=tk.FLAT,
+            borderwidth=0,
+            highlightthickness=1,
+            highlightbackground=THEME["border"],
+        )
+        detail.grid(row=2, column=0, sticky="nsew", padx=12, pady=(0, 12))
+        _style_scrolled_text(detail)
+        detail.tag_configure("metadata", foreground=THEME["muted"], font=("Segoe UI", 9, "bold"))
+
+        results_by_item: dict[str, object] = {}
+        for rank, result in enumerate(answer.results, 1):
+            kind = "Neighbor" if result.lexical_score == 0 and result.semantic_score == 0 else "Direct hit"
+            item = table.insert(
+                "",
+                tk.END,
+                values=(
+                    rank,
+                    result.chunk.source,
+                    result.chunk.page or "-",
+                    kind,
+                    f"{result.score:.3f}",
+                    f"{result.confidence:.3f}",
+                    f"{result.lexical_score:.3f}",
+                    f"{result.semantic_score:.3f}",
+                ),
+            )
+            results_by_item[item] = result
+
+        def show_selected(_event: tk.Event | None = None) -> None:
+            selection = table.selection()
+            if not selection:
+                return
+            result = results_by_item[selection[0]]
+            metadata = [result.chunk.source]
+            if result.chunk.page:
+                location = "slide" if result.chunk.source.casefold().endswith((".ppt", ".pptx")) else "page"
+                metadata.append(f"{location} {result.chunk.page}")
+            if result.chunk.heading:
+                metadata.append(result.chunk.heading)
+            detail.configure(state=tk.NORMAL)
+            detail.delete("1.0", tk.END)
+            detail.insert(tk.END, " | ".join(metadata) + "\n\n", "metadata")
+            detail.insert(tk.END, result.chunk.text)
+            detail.configure(state=tk.DISABLED)
+
+        table.bind("<<TreeviewSelect>>", show_selected)
+        first_item = table.get_children()
+        if first_item:
+            table.selection_set(first_item[0])
+            table.focus(first_item[0])
+            show_selected()
+
+    def _apply_retrieval_preset(self, _event: tk.Event | None = None) -> None:
+        preset = self.retrieval_preset_var.get()
+        values = RETRIEVAL_PRESETS.get(preset)
+        if values is not None:
+            top_k, neighbors = values
+            self.top_k_var.set(top_k)
+            self.neighbor_window_var.set(neighbors)
+        custom_state = tk.NORMAL if preset == "Custom" else tk.DISABLED
+        self.top_k_entry.configure(state=custom_state)
+        self.neighbor_spinbox.configure(state=custom_state)
+
+    def _clear_combobox_highlight(self, event: tk.Event) -> None:
+        combo_box = event.widget
+
+        def clear() -> None:
+            try:
+                combo_box.selection_clear()
+                self.focus_set()
+            except tk.TclError:
+                pass
+
+        self.after_idle(clear)
+
+    def _apply_theme(self, _event: tk.Event | None = None) -> None:
+        THEME.clear()
+        THEME.update(theme_palette(self.theme_var.get()))
+        self._configure_style()
+        self.document_list.configure(
+            background=THEME["field"], foreground=THEME["text"],
+            selectbackground=THEME["selection"], highlightbackground=THEME["border"],
+            highlightcolor=THEME["accent"],
+        )
+        self.drop_hint.configure(background=THEME["panel_raised"], foreground=THEME["accent"])
+        for text_widget in (self.transcript, self.question):
+            text_widget.configure(
+                background=THEME["field"], foreground=THEME["text"],
+                insertbackground=THEME["text"], selectbackground=THEME["selection"],
+                highlightbackground=THEME["border"], highlightcolor=THEME["accent"],
+            )
+        _style_scrolled_text(self.transcript)
+        self.transcript.tag_configure("user", foreground=THEME["accent"])
+        self.transcript.tag_configure("assistant", foreground=THEME["success"])
+        self.transcript.tag_configure("sources", foreground=THEME["muted"])
+        self.transcript.tag_configure("confidence_high", foreground=THEME["success"])
+        self.transcript.tag_configure("confidence_medium", foreground=THEME["warning"])
+        self.transcript.tag_configure("confidence_low", foreground=THEME["danger"])
+        self.transcript.tag_configure("source_link", foreground=THEME["accent_hover"])
+        self.status_label.configure(
+            background=THEME["status_busy"] if self.busy else THEME["status_ready"],
+            foreground=THEME["text"],
+        )
+
+    def _toggle_theme(self) -> None:
+        self.theme_var.set("Light" if self.theme_var.get() == "Dark" else "Dark")
+        self._apply_theme()
+        self.theme_button.configure(
+            text="☀" if self.theme_var.get() == "Dark" else "☾"
+        )
 
     def _resolved_top_k(self) -> int | None:
         raw_value = self.top_k_var.get().strip()
@@ -387,6 +793,14 @@ class RAGDesktopApp(TkinterDnD.Tk):
                 messages.append("Legacy .doc support unavailable on this OS; convert .doc files to .docx.")
             else:
                 messages.append("Legacy .doc support requires Microsoft Word installed locally.")
+
+        if ".pptx" in suffixes:
+            messages.append("PowerPoint PPTX support: ok")
+        if ".ppt" in suffixes:
+            if os.name != "nt":
+                messages.append("Legacy .ppt support unavailable on this OS; convert .ppt files to .pptx.")
+            else:
+                messages.append("Legacy .ppt support requires Microsoft PowerPoint installed locally.")
 
         ocr_modules = all(
             importlib.util.find_spec(module) is not None
@@ -476,6 +890,19 @@ class RAGDesktopApp(TkinterDnD.Tk):
             return None
         return target
 
+    def _open_selected_document(self, _event: tk.Event | None = None) -> None:
+        target = self._selected_document_path()
+        if target is None:
+            return
+        if not target.is_file():
+            messagebox.showwarning("Missing file", "The selected file no longer exists.", parent=self)
+            self._refresh_document_list()
+            return
+        try:
+            os.startfile(target)
+        except OSError as exc:
+            messagebox.showwarning("Open file failed", str(exc), parent=self)
+
     def _refresh_selected_document(self) -> None:
         target = self._selected_document_path()
         if target is None:
@@ -493,25 +920,29 @@ class RAGDesktopApp(TkinterDnD.Tk):
                 "Select a file", "Choose a knowledge file to remove first.", parent=self
             )
             return
-        relative_path = Path(self.document_list.get(selection[0]))
-        target = (self.documents_dir / relative_path).resolve()
         documents_root = self.documents_dir.resolve()
-        if documents_root not in target.parents:
-            messagebox.showerror("Invalid file", "The selected path is not safe.", parent=self)
-            return
+        targets = []
+        for index in selection:
+            relative_path = Path(self.document_list.get(index))
+            target = (self.documents_dir / relative_path).resolve()
+            if documents_root not in target.parents:
+                messagebox.showerror("Invalid file", "A selected path is not safe.", parent=self)
+                return
+            targets.append((relative_path, target))
         if not messagebox.askyesno(
-            "Remove knowledge file",
-            f"Remove '{relative_path}' from the knowledge base?",
+            "Remove knowledge files",
+            f"Remove {len(targets)} selected file(s) from the knowledge base?",
             parent=self,
         ):
             return
         try:
-            target.unlink()
+            for _relative_path, target in targets:
+                target.unlink()
         except OSError as exc:
             messagebox.showerror("Removal failed", str(exc), parent=self)
             return
         self._refresh_document_list()
-        self._rebuild_index(f"Removed {relative_path.name}. Rebuilding index...")
+        self._rebuild_index(f"Removed {len(targets)} file(s). Updating index...")
     def _set_busy(self, busy: bool, message: str) -> None:
         self.busy = busy
         state = tk.DISABLED if busy else tk.NORMAL
@@ -525,6 +956,11 @@ class RAGDesktopApp(TkinterDnD.Tk):
             background=THEME["status_busy"] if busy else THEME["status_ready"],
             foreground=THEME["text"],
         )
+
+    def _cancel_indexing(self) -> None:
+        self.index_cancel_event.set()
+        self.cancel_index_button.configure(state=tk.DISABLED)
+        self.status.set("CANCELLING INDEX UPDATE...")
     def _rebuild_index(self, message: str = "Rebuilding index...") -> None:
         if self.busy:
             return
@@ -539,6 +975,15 @@ class RAGDesktopApp(TkinterDnD.Tk):
             for path in all_file_paths
             if path.suffix.casefold() in _SUPPORTED_SUFFIXES
         ]
+        signatures = {
+            path.relative_to(self.documents_dir).as_posix(): (path.stat().st_mtime_ns, path.stat().st_size)
+            for path in document_paths
+        }
+        changed_sources = {
+            source for source, signature in signatures.items()
+            if self.indexed_file_signatures.get(source) != signature
+        }
+        removed_sources = set(self.indexed_file_signatures) - set(signatures)
         skipped_paths = [
             path
             for path in all_file_paths
@@ -555,6 +1000,10 @@ class RAGDesktopApp(TkinterDnD.Tk):
             self.status_label.configure(background=THEME["status_busy"], foreground=THEME["text"])
             return
         self._set_busy(True, message)
+        self.index_cancel_event.clear()
+        self.cancel_index_button.configure(state=tk.NORMAL)
+        self.index_activity.grid()
+        self.index_progress.start(12)
 
         def worker() -> None:
             new_pipeline = None
@@ -567,13 +1016,51 @@ class RAGDesktopApp(TkinterDnD.Tk):
                     old_pipeline, self.pipeline = self.pipeline, None
                     if old_pipeline is not None:
                         old_pipeline.close()
-                embedder = optional_foundry_embedder("qwen3-embedding-0.6b", cache_dir=self.cache_dir) if self.use_embeddings_var.get() else None
+                def report_embedding_progress(current: int, total: int) -> None:
+                    self.after(
+                        0,
+                        lambda current=current, total=total: self.status.set(
+                            f"EMBEDDING {current}/{total} CHUNKS" if current < total else "FINALIZING INDEX..."
+                        ),
+                    )
+
+                embedder = optional_foundry_embedder(
+                    "qwen3-embedding-0.6b",
+                    cache_dir=self.cache_dir,
+                    progress_callback=report_embedding_progress,
+                    cancel_check=self.index_cancel_event.is_set,
+                ) if self.use_embeddings_var.get() else None
                 using_embeddings = embedder is not None
+                def report_progress(source: str, current: int, total: int) -> None:
+                    self.after(
+                        0,
+                        lambda source=source, current=current, total=total: self.status.set(
+                            f"INDEXING {current}/{total}: {source}".upper()
+                        ),
+                    )
                 new_pipeline = RAGPipeline.from_directory(
-                    self.documents_dir, embedder=embedder, cache_dir=self.cache_dir, neighbor_window=neighbor_window
+                    self.documents_dir,
+                    embedder=embedder,
+                    cache_dir=self.cache_dir,
+                    neighbor_window=neighbor_window,
+                    progress_callback=report_progress,
+                    cancel_check=self.index_cancel_event.is_set,
                 )
+                if self.index_cancel_event.is_set():
+                    new_pipeline.close()
+                    new_pipeline = None
+                    self.after(0, self._finish_cancelled_index)
+                    return
                 embedder = None
                 chunk_count = len(new_pipeline.retriever.chunks)
+                chunk_counts = Counter(
+                    chunk.source for chunk in new_pipeline.retriever.chunks
+                )
+                page_sets: dict[str, set[int]] = {}
+                for chunk in new_pipeline.retriever.chunks:
+                    if chunk.page:
+                        page_sets.setdefault(chunk.source, set()).add(chunk.page)
+                page_counts = {source: len(pages) for source, pages in page_sets.items()}
                 with self.pipeline_lock:
                     self.pipeline = new_pipeline
                     new_pipeline = None
@@ -584,11 +1071,14 @@ class RAGDesktopApp(TkinterDnD.Tk):
                     neighbor_window,
                     using_embeddings,
                 )
+                summary += (
+                    f"\nIncremental update: {len(changed_sources)} changed, "
+                    f"{len(signatures) - len(changed_sources)} reused, {len(removed_sources)} removed"
+                )
                 self.after(
                     0,
-                    lambda summary=summary: (
-                        self._set_busy(False, "Ready"),
-                        self._append_status_message(summary),
+                    lambda summary=summary, signatures=signatures, chunk_counts=chunk_counts, page_counts=page_counts: self._finish_index_update(
+                        summary, signatures, chunk_counts, page_counts
                     ),
                 )
             except Exception as exc:
@@ -596,11 +1086,35 @@ class RAGDesktopApp(TkinterDnD.Tk):
                     new_pipeline.close()
                 elif embedder is not None:
                     embedder.close()
+                if self.index_cancel_event.is_set() and str(exc) == "Indexing cancelled":
+                    self.after(0, self._finish_cancelled_index)
+                    return
                 LOGGER.exception("Could not build the RAG index")
                 message = str(exc)
                 self.after(0, lambda message=message: self._show_error("Indexing failed", message))
 
         threading.Thread(target=worker, daemon=True, name="rag-indexer").start()
+
+    def _finish_index_update(
+        self,
+        summary: str,
+        signatures: dict[str, tuple[int, int]],
+        chunk_counts: Counter[str],
+        page_counts: dict[str, int],
+    ) -> None:
+        self.index_progress.stop()
+        self.index_activity.grid_remove()
+        self.indexed_file_signatures = signatures
+        self.document_chunk_counts = chunk_counts
+        self.document_page_counts = page_counts
+        self._set_busy(False, "Ready")
+        self._refresh_document_list()
+        self._append_status_message(summary)
+
+    def _finish_cancelled_index(self) -> None:
+        self.index_progress.stop()
+        self.index_activity.grid_remove()
+        self._set_busy(False, "Index update cancelled")
 
     def _send_from_event(self, event: tk.Event) -> str | None:
         if event.state & 0x0001:
@@ -629,7 +1143,7 @@ class RAGDesktopApp(TkinterDnD.Tk):
                     if self.pipeline is None:
                         raise RuntimeError("The document index is not available")
                     answer = self.pipeline.ask(question, top_k)
-                self.after(0, lambda: self._display_answer(answer))
+                self.after(0, lambda: self._display_answer(answer, question))
             except Exception as exc:
                 LOGGER.exception("RAG request failed")
                 message = str(exc)
@@ -644,18 +1158,10 @@ class RAGDesktopApp(TkinterDnD.Tk):
         self.transcript.configure(state=tk.DISABLED)
         self.transcript.see(tk.END)
 
-    def _answer_for_mode(self, answer: Answer) -> Answer:
+    def _answer_for_mode(self, answer: Answer, question: str = "") -> Answer:
         if self.answer_mode_var.get() != "Flexible" or not answer.sources:
             return answer
-        compact = re.sub(r"\s+", " ", answer.text).strip()
-        if not compact:
-            return answer
-        if compact.startswith("The provided documents do not contain enough information"):
-            return answer
-        if compact.startswith(("- ", "* ")) or "\n- " in answer.text:
-            flexible_text = f"Based on the cited source:\n{answer.text.strip()}"
-        else:
-            flexible_text = f"Based on the cited source, {compact}"
+        flexible_text = flexible_answer_text(question, answer.text)
         return replace(answer, text=flexible_text)
 
     def _confidence_summary(self, answer: Answer) -> tuple[str, str, str]:
@@ -707,10 +1213,14 @@ class RAGDesktopApp(TkinterDnD.Tk):
                 lines.append(f"{index}. {result.chunk.source} ({score}): {snippet}")
         return "\n".join(lines)
 
-    def _display_answer(self, answer: Answer) -> None:
+    def _display_answer(self, answer: Answer, question: str = "") -> None:
         evidence_answer = answer
-        display_answer = self._answer_for_mode(answer)
+        display_answer = self._answer_for_mode(answer, question)
         self.last_answer = display_answer
+        self.last_evidence_answer = evidence_answer
+        self.inspect_retrieval_button.configure(
+            state=tk.NORMAL if evidence_answer.results else tk.DISABLED
+        )
         self._append_message("Assistant", display_answer.text, "assistant")
         level, confidence_tag, confidence_reason = self._confidence_summary(evidence_answer)
         self.transcript.configure(state=tk.NORMAL)
@@ -740,6 +1250,17 @@ class RAGDesktopApp(TkinterDnD.Tk):
         tag = f"source_link_{self.source_link_counter}"
         self.source_link_payloads[tag] = (source, answer)
         self.transcript.insert(tk.END, source, ("sources", "source_link", tag))
+        source_name = re.sub(r"\s+\((?:page|slide)\s+\d+\)$", "", source).strip()
+        heading = next(
+            (
+                result.chunk.heading
+                for result in answer.results
+                if result.chunk.source == source_name and result.chunk.heading
+            ),
+            None,
+        )
+        if heading:
+            self.transcript.insert(tk.END, f" - {heading}", "sources")
         self.transcript.tag_bind(tag, "<Button-1>", lambda _event, tag=tag: self._open_source_link(tag))
         self.transcript.tag_bind(tag, "<Enter>", lambda _event: self.transcript.configure(cursor="hand2"))
         self.transcript.tag_bind(tag, "<Leave>", lambda _event: self.transcript.configure(cursor=""))
@@ -750,21 +1271,17 @@ class RAGDesktopApp(TkinterDnD.Tk):
             return
         source, answer = payload
         source_path = self._source_file_path(source)
-        if source_path.exists():
-            try:
-                os.startfile(source_path)
-            except OSError as exc:
-                messagebox.showwarning("Open source failed", str(exc), parent=self)
-        else:
+        if not source_path.exists():
             messagebox.showwarning("Source not found", f"Could not find {source_path}", parent=self)
+            return
         self._show_source_context(source, answer, source_path)
 
     def _source_file_path(self, source: str) -> Path:
-        source_name = re.sub(r"\s+\(page\s+\d+\)$", "", source).strip()
+        source_name = re.sub(r"\s+\((?:page|slide)\s+\d+\)$", "", source).strip()
         return self.documents_dir / Path(source_name)
 
     def _source_context_chunks(self, source: str, answer: Answer) -> list[dict[str, object]]:
-        source_name = re.sub(r"\s+\(page\s+\d+\)$", "", source).strip()
+        source_name = re.sub(r"\s+\((?:page|slide)\s+\d+\)$", "", source).strip()
         answer_terms = {
             token.casefold()
             for token in re.findall(r"[^\W\d_]+|\d+", answer.text, flags=re.UNICODE)
@@ -846,6 +1363,7 @@ class RAGDesktopApp(TkinterDnD.Tk):
             ]
 
         window = tk.Toplevel(self)
+        apply_window_frame(window, THEME, self.theme_var.get())
         window.title(f"Evidence - {source}")
         window.geometry("880x560")
         window.minsize(620, 400)
@@ -871,6 +1389,7 @@ class RAGDesktopApp(TkinterDnD.Tk):
         next_button.grid(row=0, column=2, sticky="e")
 
         viewer = ScrolledText(window, wrap=tk.WORD, font=("Segoe UI", 10), padx=12, pady=12, background=THEME["field"], foreground=THEME["text"], insertbackground=THEME["text"], selectbackground=THEME["selection"], selectforeground="#ffffff", relief=tk.FLAT, borderwidth=0, highlightthickness=1, highlightbackground=THEME["border"], highlightcolor=THEME["accent"])
+        _style_scrolled_text(viewer)
         viewer.grid(row=2, column=0, sticky="nsew", padx=12, pady=(0, 12))
         viewer.tag_configure("metadata", foreground=THEME["muted"], font=("Segoe UI", 9, "bold"))
         viewer.tag_configure("evidence", background="#1f2a36")
@@ -887,7 +1406,8 @@ class RAGDesktopApp(TkinterDnD.Tk):
             matched_terms = payload.get("matched_terms") or []
             source_bits = [f"Chunk {index + 1} of {len(chunks)}"]
             if page:
-                source_bits.append(f"page {page}")
+                location = "slide" if source_path.suffix.casefold() in {".ppt", ".pptx"} else "page"
+                source_bits.append(f"{location} {page}")
             if heading:
                 source_bits.append(str(heading))
             score_line = (
@@ -921,11 +1441,31 @@ class RAGDesktopApp(TkinterDnD.Tk):
         render()
 
     def _show_error(self, title: str, message: str) -> None:
+        self.index_progress.stop()
+        self.index_activity.grid_remove()
         self._set_busy(False, "Error")
         self.status_label.configure(background=THEME["status_error"], foreground=THEME["text"])
         messagebox.showerror(title, message, parent=self)
 
     def _on_close(self) -> None:
+        try:
+            save_app_settings(
+                self.settings_path,
+                AppSettings(
+                    retrieval_preset=self.retrieval_preset_var.get(),
+                    top_k=self.top_k_var.get(),
+                    neighbors=self._resolved_neighbor_window(),
+                    use_embeddings=self.use_embeddings_var.get(),
+                    show_diagnostics=self.show_diagnostics_var.get(),
+                    answer_mode=self.answer_mode_var.get(),
+                    file_sort=self.document_sort_var.get(),
+                    geometry=self.geometry(),
+                    sidebar_visible=self.sidebar_visible,
+                    theme=self.theme_var.get(),
+                ),
+            )
+        except (OSError, ValueError, tk.TclError):
+            LOGGER.exception("Could not save application settings")
         with self.pipeline_lock:
             if self.pipeline is not None:
                 self.pipeline.close()

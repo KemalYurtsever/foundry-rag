@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import math
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -23,6 +24,26 @@ LOGGER = logging.getLogger(__name__)
 
 
 _NUMBERED_DISPLAY_HEADING_RE = re.compile(r"^\s*\d+(?:\.\d+)*[.)]?\s+\S")
+_YES_NO_QUESTION_RE = re.compile(
+    r"^\s*(?:am|are|can|could|did|do|does|had|has|have|is|should|was|were|will|would)\b",
+    flags=re.IGNORECASE,
+)
+_NEGATIVE_EVIDENCE_RE = re.compile(
+    r"\b(?:cannot|can't|didn't|doesn't|hadn't|hasn't|haven't|isn't|never|no|not|unable|wasn't|weren't|without)\b",
+    flags=re.IGNORECASE,
+)
+_LIST_QUESTION_RE = re.compile(
+    r"\b(?:what are|which|list|features|functions|steps|requirements|advantages|disadvantages)\b",
+    flags=re.IGNORECASE,
+)
+_COMPARISON_QUESTION_RE = re.compile(
+    r"\b(?:compare|comparison|difference|differences|versus|vs\.?|pros and cons)\b",
+    flags=re.IGNORECASE,
+)
+_SHORT_VALUE_QUESTION_RE = re.compile(
+    r"^\s*(?:how many|how much|when|what (?:date|time|number|amount|price|size|color|colour|shape))\b",
+    flags=re.IGNORECASE,
+)
 
 
 def _is_display_heading(line: str) -> bool:
@@ -127,6 +148,80 @@ def _format_verified_quote(quote: str) -> str:
     return "\n".join(output).strip()
 
 
+def _deduplicate_answer_text(text: str) -> str:
+    """Remove exact repeated sentences/lines introduced by overlapping chunks."""
+    seen: set[str] = set()
+    output_lines: list[str] = []
+
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            if output_lines and output_lines[-1]:
+                output_lines.append("")
+            continue
+
+        segments = re.split(r"(?<=[.!?])\s+", stripped)
+        unique_segments: list[str] = []
+        for segment in segments:
+            normalized = re.sub(r"\s+", " ", segment).strip().casefold()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            unique_segments.append(segment.strip())
+        if unique_segments:
+            output_lines.append(" ".join(unique_segments))
+
+    while output_lines and not output_lines[-1]:
+        output_lines.pop()
+    return "\n".join(output_lines).strip()
+
+
+def _merge_quote_overlaps(quotes: list[str]) -> str:
+    """Join quotations while removing a shared word-level boundary."""
+    merged = ""
+    for quote in (item.strip() for item in quotes if item.strip()):
+        if not merged:
+            merged = quote
+            continue
+        left_words = list(re.finditer(r"\S+", merged))
+        right_words = list(re.finditer(r"\S+", quote))
+        overlap = 0
+        limit = min(80, len(left_words), len(right_words))
+        for size in range(limit, 2, -1):
+            left = " ".join(match.group(0).casefold() for match in left_words[-size:])
+            right = " ".join(match.group(0).casefold() for match in right_words[:size])
+            if left == right:
+                overlap = right_words[size - 1].end()
+                break
+        remainder = quote[overlap:].lstrip() if overlap else quote
+        if remainder:
+            merged = f"{merged}\n{remainder}"
+    return merged
+
+
+def flexible_answer_text(question: str, grounded_text: str) -> str:
+    """Present grounded evidence concisely without introducing new factual detail."""
+    text = grounded_text.strip()
+    if not text or text.startswith(NO_ANSWER):
+        return text
+    if not _YES_NO_QUESTION_RE.match(question):
+        compact = re.sub(r"\s+", " ", text)
+        if _SHORT_VALUE_QUESTION_RE.match(question):
+            return re.split(r"(?<=[.!?])\s+", compact, maxsplit=1)[0]
+        if _COMPARISON_QUESTION_RE.search(question):
+            return f"Comparison based on the cited source:\n{text}"
+        if text.startswith(("- ", "* ")) or "\n- " in text:
+            return f"Based on the cited source:\n{text}"
+        if _LIST_QUESTION_RE.search(question) and "\n" in text:
+            return f"Based on the cited source:\n{text}"
+        return f"Based on the cited source, {compact}"
+
+    compact = re.sub(r"\s+", " ", text)
+    first_sentence = re.split(r"(?<=[.!?])\s+", compact, maxsplit=1)[0]
+    decision = "No" if _NEGATIVE_EVIDENCE_RE.search(first_sentence) else "Yes"
+    return f"{decision}. {first_sentence}"
+
+
 _CANONICAL_SYNONYMS = {
     "capability": "function",
     "feature": "function",
@@ -183,6 +278,8 @@ class RAGPipeline:
         neighbor_window: int = 0,
         ocr: bool = False,
         ocr_language: str = "eng",
+        progress_callback: Callable[[str, int, int], None] | None = None,
+        cancel_check: Callable[[], bool] | None = None,
     ) -> "RAGPipeline":
         chunks = load_documents(
             directory,
@@ -191,6 +288,8 @@ class RAGPipeline:
             cache_dir,
             ocr,
             ocr_language,
+            progress_callback,
+            cancel_check,
         )
         return cls(HybridRetriever(chunks, embedder), generator, neighbor_window)
 
@@ -368,14 +467,15 @@ class RAGPipeline:
         formatted_quotes = [
             _format_verified_quote(item.quote) for item in evidence
         ]
-        text = "\n".join(quote for quote in formatted_quotes if quote)
+        text = _deduplicate_answer_text(_merge_quote_overlaps(formatted_quotes))
         if not text:
             return Answer(NO_ANSWER, (), tuple(expanded_results), ("validated evidence formatted to empty text",))
         sources = tuple(
             dict.fromkeys(
                 (
                     f"{chunks_by_id[item.chunk_id].source} "
-                    f"(page {chunks_by_id[item.chunk_id].page})"
+                    f"({'slide' if chunks_by_id[item.chunk_id].source.casefold().endswith(('.ppt', '.pptx')) else 'page'} "
+                    f"{chunks_by_id[item.chunk_id].page})"
                     if chunks_by_id[item.chunk_id].page
                     else chunks_by_id[item.chunk_id].source
                 )

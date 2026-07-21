@@ -429,6 +429,27 @@ class ExtractiveGenerator:
         if not results:
             return EvidenceSelection(False)
 
+        # A broad request matching a presentation slide title should return the
+        # slide itself, rather than isolated sentences from later slides that only
+        # mention the topic incidentally.
+        query_terms = {
+            _canonical_term(term) for term in question_evidence_terms(question)
+        }
+        for result in results:
+            heading_terms = _canonical_terms(result.chunk.heading or "")
+            is_presentation = result.chunk.source.casefold().endswith((".ppt", ".pptx"))
+            if (
+                is_presentation
+                and heading_terms
+                and heading_terms <= query_terms
+                and result.chunk.text.strip()
+                and not _contains_unsafe_document_instruction(result.chunk.text)
+            ):
+                return EvidenceSelection(
+                    True,
+                    (Evidence(result.chunk.id, result.chunk.text.strip()),),
+                )
+
         # First handle explicit list/section questions deterministically. This avoids
         # depending on a chat model to serialize long evidence as JSON.
         section_candidates: list[tuple[float, Evidence]] = []

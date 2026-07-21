@@ -3,10 +3,12 @@ from __future__ import annotations
 import hashlib
 import importlib
 import math
+import os
 import re
 import subprocess
 import tempfile
 import zipfile
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from xml.etree import ElementTree
@@ -14,8 +16,8 @@ from xml.etree import ElementTree
 from .database import SQLiteStore
 
 
-_EXTRACTION_CACHE_VERSION = 4
-_SUPPORTED_SUFFIXES = {".txt", ".md", ".pdf", ".doc", ".docx"}
+_EXTRACTION_CACHE_VERSION = 5
+_SUPPORTED_SUFFIXES = {".txt", ".md", ".pdf", ".doc", ".docx", ".ppt", ".pptx"}
 
 
 @dataclass(frozen=True)
@@ -295,6 +297,90 @@ def _extract_docx(path: Path) -> str:
     return "\n\n".join(blocks)
 
 
+def _extract_pptx_slides(path: Path) -> list[tuple[str, int | None]]:
+    """Extract visible text from each PPTX slide in presentation order."""
+    drawing_namespace = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
+    try:
+        with zipfile.ZipFile(path) as archive:
+            slide_names = [
+                name
+                for name in archive.namelist()
+                if re.fullmatch(r"ppt/slides/slide\d+\.xml", name)
+            ]
+            slide_names.sort(
+                key=lambda name: int(re.search(r"(\d+)\.xml$", name).group(1))
+            )
+            roots = [ElementTree.fromstring(archive.read(name)) for name in slide_names]
+    except (zipfile.BadZipFile, KeyError, ElementTree.ParseError, AttributeError) as exc:
+        raise ValueError(f"Cannot read PPTX file '{path}': {exc}") from exc
+
+    slides: list[tuple[str, int | None]] = []
+    for slide_number, root in enumerate(roots, 1):
+        paragraphs: list[str] = []
+        for paragraph in root.iter(f"{drawing_namespace}p"):
+            fragments = [
+                node.text or ""
+                for node in paragraph.iter(f"{drawing_namespace}t")
+            ]
+            text = "".join(fragments).strip()
+            if text:
+                paragraphs.append(text)
+        slides.append(("\n".join(paragraphs), slide_number))
+    return slides
+
+
+def _extract_ppt_slides(path: Path) -> list[tuple[str, int | None]]:
+    """Extract legacy PPT slide text through Microsoft PowerPoint on Windows."""
+    script = r"""
+$powerPoint = $null
+$presentation = $null
+$slides = @()
+try {
+  $powerPoint = New-Object -ComObject PowerPoint.Application
+  $presentation = $powerPoint.Presentations.Open($env:FOUNDRY_RAG_PPT_INPUT, $true, $true, $false)
+  foreach ($slide in $presentation.Slides) {
+    $lines = @()
+    foreach ($shape in $slide.Shapes) {
+      if ($shape.HasTextFrame -and $shape.TextFrame.HasText) {
+        $text = $shape.TextFrame.TextRange.Text.Trim()
+        if ($text) { $lines += $text }
+      }
+    }
+    $slides += ($lines -join "`n")
+  }
+  [System.IO.File]::WriteAllText($env:FOUNDRY_RAG_PPT_OUTPUT, ($slides -join "`f"), [System.Text.Encoding]::UTF8)
+} finally {
+  if ($presentation) { $presentation.Close() }
+  if ($powerPoint) { $powerPoint.Quit() }
+}
+"""
+    with tempfile.TemporaryDirectory() as folder:
+        output = Path(folder) / "slides.txt"
+        process_environment = os.environ.copy()
+        process_environment.update(
+            {
+                "FOUNDRY_RAG_PPT_INPUT": str(path.resolve()),
+                "FOUNDRY_RAG_PPT_OUTPUT": str(output),
+            }
+        )
+        try:
+            completed = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                check=False,
+                env=process_environment,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise RuntimeError(f"Cannot read legacy PPT file '{path}': {exc}") from exc
+        if completed.returncode != 0 or not output.exists():
+            detail = completed.stderr.strip() or "Microsoft PowerPoint is not installed or could not open the file"
+            raise RuntimeError(f"Cannot read legacy PPT file '{path}': {detail}")
+        texts = output.read_text(encoding="utf-8-sig", errors="replace").split("\f")
+        return [(text.strip(), index) for index, text in enumerate(texts, 1)]
+
+
 def _pdf_reader(path: Path):
     try:
         from pypdf import PdfReader
@@ -377,8 +463,8 @@ $document = $null
 try {
   $word = New-Object -ComObject Word.Application
   $word.Visible = $false
-  $document = $word.Documents.Open($args[0], $false, $true)
-  $document.SaveAs2($args[1], 2)
+  $document = $word.Documents.Open($env:FOUNDRY_RAG_DOC_INPUT, $false, $true)
+  $document.SaveAs2($env:FOUNDRY_RAG_DOC_OUTPUT, 2)
 } finally {
   if ($document) { $document.Close($false) }
   if ($word) { $word.Quit() }
@@ -386,6 +472,13 @@ try {
 """
     with tempfile.TemporaryDirectory() as folder:
         output = Path(folder) / "converted.txt"
+        process_environment = os.environ.copy()
+        process_environment.update(
+            {
+                "FOUNDRY_RAG_DOC_INPUT": str(path.resolve()),
+                "FOUNDRY_RAG_DOC_OUTPUT": str(output),
+            }
+        )
         try:
             completed = subprocess.run(
                 [
@@ -394,13 +487,12 @@ try {
                     "-NonInteractive",
                     "-Command",
                     script,
-                    str(path.resolve()),
-                    str(output),
                 ],
                 capture_output=True,
                 text=True,
                 timeout=60,
                 check=False,
+                env=process_environment,
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise RuntimeError(f"Cannot read legacy DOC file '{path}': {exc}") from exc
@@ -423,6 +515,10 @@ def extract_text(path: Path) -> str:
         return _extract_pdf(path)
     if suffix == ".doc":
         return _extract_doc(path)
+    if suffix == ".pptx":
+        return "\n\n".join(text for text, _slide in _extract_pptx_slides(path))
+    if suffix == ".ppt":
+        return "\n\n".join(text for text, _slide in _extract_ppt_slides(path))
     raise ValueError(f"Unsupported document type: {path}")
 
 
@@ -449,6 +545,8 @@ def load_documents(
     cache_dir: str | Path | None = None,
     ocr: bool = False,
     ocr_language: str = "eng",
+    progress_callback: Callable[[str, int, int], None] | None = None,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> list[Chunk]:
     root = Path(directory)
     if not root.is_dir():
@@ -459,9 +557,15 @@ def load_documents(
     active_sources: set[str] = set()
     chunks: list[Chunk] = []
 
-    for path in sorted(root.rglob("*")):
-        if not path.is_file() or path.suffix.lower() not in _SUPPORTED_SUFFIXES:
-            continue
+    document_paths = [
+        path for path in sorted(root.rglob("*"))
+        if path.is_file() and path.suffix.lower() in _SUPPORTED_SUFFIXES
+    ]
+    for file_index, path in enumerate(document_paths, 1):
+        if cancel_check and cancel_check():
+            raise RuntimeError("Indexing cancelled")
+        if progress_callback:
+            progress_callback(path.relative_to(root).as_posix(), file_index, len(document_paths))
 
         source = path.relative_to(root).as_posix()
         active_sources.add(source)
@@ -470,11 +574,14 @@ def load_documents(
             store.get_document_sections(collection, source, digest) if store else None
         )
         if sections is None:
-            sections = (
-                _extract_pdf_pages(path, ocr, ocr_language)
-                if path.suffix.lower() == ".pdf"
-                else [(extract_text(path), None)]
-            )
+            if path.suffix.lower() == ".pdf":
+                sections = _extract_pdf_pages(path, ocr, ocr_language)
+            elif path.suffix.lower() == ".pptx":
+                sections = _extract_pptx_slides(path)
+            elif path.suffix.lower() == ".ppt":
+                sections = _extract_ppt_slides(path)
+            else:
+                sections = [(extract_text(path), None)]
             if store:
                 store.put_document_sections(collection, source, digest, sections)
 

@@ -4,7 +4,7 @@ import unittest
 
 from foundry_rag.documents import Chunk, chunk_text
 from foundry_rag.generators import NO_ANSWER, Evidence, EvidenceSelection
-from foundry_rag.pipeline import RAGPipeline
+from foundry_rag.pipeline import RAGPipeline, _deduplicate_answer_text, _merge_quote_overlaps
 from foundry_rag.retriever import HybridRetriever, content_tokens
 
 
@@ -23,6 +23,29 @@ class FixedGenerator:
 
 
 class StrictRAGTests(unittest.TestCase):
+    def test_overlapping_evidence_deduplicates_repeated_sentence(self):
+        sentence = (
+            "Since the project team did not have access to the website's source code "
+            "or internal infrastructure, the evaluation used black-box testing."
+        )
+        answer = _deduplicate_answer_text(
+            f"{sentence}\n{sentence} The website was tested from an external user's perspective."
+        )
+
+        self.assertEqual(answer.count(sentence), 1)
+        self.assertIn("The website was tested from an external user's perspective.", answer)
+
+    def test_partial_chunk_boundary_overlap_is_merged(self):
+        answer = _merge_quote_overlaps(
+            [
+                "The review covered authentication and account recovery procedures.",
+                "account recovery procedures. The team then documented the findings.",
+            ]
+        )
+
+        self.assertEqual(answer.count("account recovery procedures."), 1)
+        self.assertIn("The team then documented the findings.", answer)
+
     def test_unsupported_question_returns_no_answer(self):
         chunk = Chunk("chunk-car", "car.txt", "The car has four wheels.")
         pipeline = RAGPipeline(HybridRetriever([chunk]))
