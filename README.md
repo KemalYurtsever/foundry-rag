@@ -4,6 +4,10 @@ This is a local, keyless RAG project with structure-aware ingestion, recursive c
 
 Supported document types are `.txt`, `.md`, `.pdf`, `.docx`, legacy `.doc`, `.pptx`, and legacy `.ppt`. PowerPoint presentations are extracted and cited slide by slide. Documents are split recursively at paragraph, line, sentence, word, and character boundaries. Chunk size and overlap adapt to each document, retrieval count adapts to the model context window, and response length uses the selected model's advertised output limit. `--chunk-size`, `--overlap`, and `--top-k` are available only when you want explicit overrides. Legacy `.doc` and `.ppt` extraction use installed copies of Microsoft Word and PowerPoint respectively; modern `.docx` and `.pptx` files do not require Office.
 
+## Project presentation
+
+[Watch the Foundry Local RAG presentation on YouTube](https://www.youtube.com/watch?v=NHJ2ffBocgg).
+
 ## Install and test
 
 ```powershell
