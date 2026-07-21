@@ -9,7 +9,7 @@ from types import SimpleNamespace
 from unittest import mock
 from contextlib import redirect_stdout
 
-from foundry_rag.documents import Chunk, chunk_text, extract_text, load_documents
+from foundry_rag.documents import Chunk, _extract_ppt_slides, chunk_text, extract_text, load_documents
 from foundry_rag.generators import ExtractiveGenerator, FoundryLocalGenerator, _validate_generation_model
 from foundry_rag.embeddings import FoundryEmbeddingProvider
 from foundry_rag.pipeline import RAGPipeline
@@ -201,6 +201,57 @@ class RAGTests(unittest.TestCase):
             answer = RAGPipeline(HybridRetriever(load_documents(folder))).ask("What light do orchids prefer?", 1)
             self.assertEqual(answer.sources, ("plants.docx",))
             self.assertIn("indirect light", answer.text)
+
+    def test_pptx_extraction_is_slide_aware(self):
+        slide_one = b'''<?xml version="1.0" encoding="UTF-8"?>
+<p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+       xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+  <p:cSld><p:spTree><p:sp><p:txBody>
+    <a:p><a:r><a:t>Project timeline</a:t></a:r></a:p>
+    <a:p><a:r><a:t>The launch is scheduled for September.</a:t></a:r></a:p>
+  </p:txBody></p:sp></p:spTree></p:cSld>
+</p:sld>'''
+        slide_two = b'''<?xml version="1.0" encoding="UTF-8"?>
+<p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+       xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+  <p:cSld><p:spTree><p:sp><p:txBody>
+    <a:p><a:r><a:t>Budget</a:t></a:r></a:p>
+    <a:p><a:r><a:t>The approved budget is 40,000 EUR.</a:t></a:r></a:p>
+  </p:txBody></p:sp></p:spTree></p:cSld>
+</p:sld>'''
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "briefing.pptx"
+            with zipfile.ZipFile(path, "w") as archive:
+                archive.writestr("ppt/slides/slide2.xml", slide_two)
+                archive.writestr("ppt/slides/slide1.xml", slide_one)
+
+            chunks = load_documents(folder)
+            answer = RAGPipeline(HybridRetriever(chunks)).ask(
+                "When is the launch scheduled?", 1
+            )
+
+            self.assertEqual([chunk.page for chunk in chunks], [1, 2])
+            self.assertEqual(answer.sources, ("briefing.pptx (slide 1)",))
+            self.assertIn("September", answer.text)
+
+    def test_legacy_ppt_bridge_preserves_paths_with_spaces(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "Project presentation with spaces.ppt"
+            path.touch()
+
+            def run_bridge(command, **kwargs):
+                environment = kwargs["env"]
+                self.assertEqual(environment["FOUNDRY_RAG_PPT_INPUT"], str(path.resolve()))
+                self.assertNotIn(str(path.resolve()), command)
+                Path(environment["FOUNDRY_RAG_PPT_OUTPUT"]).write_text(
+                    "First slide\fSecond slide", encoding="utf-8"
+                )
+                return SimpleNamespace(returncode=0, stderr="")
+
+            with mock.patch("foundry_rag.documents.subprocess.run", side_effect=run_bridge):
+                slides = _extract_ppt_slides(path)
+
+            self.assertEqual(slides, [("First slide", 1), ("Second slide", 2)])
 
     def test_docx_table_extraction_preserves_headers(self):
         document_xml = b'''<?xml version="1.0" encoding="UTF-8"?>

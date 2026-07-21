@@ -20,10 +20,10 @@ _ATTRIBUTE_TERMS = {"color", "colour", "size", "shape", "date"}
 # Deliberately conservative: domain terms and acronyms such as "AI" must survive.
 STOPWORDS: set[str] = {
     # English
-    "a", "an", "and", "are", "as", "at", "be", "by", "did", "do", "does",
+    "a", "about", "an", "and", "are", "as", "at", "be", "by", "did", "do", "does",
     "for", "from", "how", "in", "is", "it", "of", "on", "or", "that",
     "the", "this", "to", "was", "what", "when", "where", "which", "who",
-    "why", "with",
+    "why", "with", "me", "tell",
     # Romanian
     "ale", "al", "care", "ce", "cine", "cu", "cum", "de", "din", "este",
     "la", "pe", "pentru", "și", "sunt", "unde",
@@ -160,6 +160,7 @@ class HybridRetriever:
 
         chunk_terms = set(content_tokens(chunk.text))
         metadata_terms = self.metadata_terms[index]
+        heading_terms = set(content_tokens(chunk.heading or ""))
 
         # Terms such as a course code or document title identify the source. Do not
         # let those scope terms compete equally with the actual requested fact.
@@ -174,8 +175,10 @@ class HybridRetriever:
             0.15 if query_normalized and query_normalized in chunk_normalized else 0.0
         )
         metadata_coverage = len(scope_terms) / len(query_terms)
+        heading_coverage = len(query_terms & heading_terms) / len(query_terms)
         confidence = min(1.0, coverage + metadata_coverage * 0.35 + phrase_bonus)
-        rerank = coverage + metadata_coverage * 0.15 + phrase_bonus
+        confidence = min(1.0, confidence + heading_coverage * 0.5)
+        rerank = coverage + metadata_coverage * 0.15 + heading_coverage * 0.6 + phrase_bonus
         return rerank, confidence
 
     def search(self, query: str, top_k: int = 3) -> list[SearchResult]:

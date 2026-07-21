@@ -2,11 +2,42 @@ import unittest
 
 from foundry_rag.documents import Chunk
 from foundry_rag.generators import NO_ANSWER
-from foundry_rag.pipeline import RAGPipeline
+from foundry_rag.pipeline import RAGPipeline, flexible_answer_text
 from foundry_rag.retriever import HybridRetriever
 
 
 class EvaluationSetTests(unittest.TestCase):
+    def test_flexible_yes_no_answer_is_concise_and_grounded(self):
+        evidence = (
+            "The project team did not have access to the website's source code. "
+            "The evaluation therefore used black-box testing."
+        )
+
+        answer = flexible_answer_text(
+            "Did the project team have access to the source code?", evidence
+        )
+
+        self.assertEqual(
+            answer,
+            "No. The project team did not have access to the website's source code.",
+        )
+
+    def test_flexible_positive_yes_no_answer_starts_with_yes(self):
+        answer = flexible_answer_text(
+            "Can administrators export reports?",
+            "Administrators can export reports as PDF files.",
+        )
+
+        self.assertEqual(answer, "Yes. Administrators can export reports as PDF files.")
+
+    def test_flexible_value_question_returns_the_direct_sentence(self):
+        answer = flexible_answer_text(
+            "When does the launch window open?",
+            "The launch window opens on Tuesday. Operators receive a reminder on Monday.",
+        )
+
+        self.assertEqual(answer, "The launch window opens on Tuesday.")
+
     def ask(self, text: str, question: str):
         chunk = Chunk("fixture#1", "fixture.txt", text)
         return RAGPipeline(HybridRetriever([chunk])).ask(question, top_k=1)
@@ -58,6 +89,44 @@ class EvaluationSetTests(unittest.TestCase):
         self.assertIn("RRR includes activities", answer.text)
         self.assertIn("acceptance criteria", answer.text)
         self.assertNotIn("attend planning meetings", answer.text)
+
+    def test_exact_topic_heading_beats_incidental_mentions(self):
+        chunks = [
+            Chunk(
+                "fortran-topic",
+                "history.pptx",
+                "Fortran\nFortran was the first effectively implemented high-level language. "
+                "It introduced variables, loops, procedures, and statement labels.",
+                page=4,
+                heading="Fortran",
+            ),
+            Chunk(
+                "fortran-incidental",
+                "control.pptx",
+                "Control Statements: Evolution\nFORTRAN control statements were based on IBM 704 hardware.",
+                page=8,
+                heading="Control Statements: Evolution",
+            ),
+            Chunk(
+                "pli-incidental",
+                "history.pptx",
+                "PL/I\nA combination of features believed best in Fortran, Algol 60, and Cobol.",
+                page=7,
+                heading="PL/I",
+            ),
+        ]
+
+        results = HybridRetriever(chunks).search("tell me about fortran", top_k=3)
+
+        self.assertEqual(results[0].chunk.id, "fortran-topic")
+        answer = RAGPipeline(HybridRetriever(chunks)).ask(
+            "tell me about fortran", top_k=3
+        )
+        self.assertIn(
+            "Fortran was the first effectively implemented high-level language.",
+            answer.text,
+        )
+        self.assertEqual(answer.sources, ("history.pptx (slide 4)",))
 
     def test_attribute_questions_use_document_words(self):
         cases = [

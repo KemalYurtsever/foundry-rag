@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import math
+from collections.abc import Callable
 from pathlib import Path
 
 from .database import SQLiteStore
@@ -24,6 +25,8 @@ class FoundryEmbeddingProvider:
         download: bool = False,
         cache_dir: str | Path = ".rag_cache",
         batch_size: int = 64,
+        progress_callback: Callable[[int, int], None] | None = None,
+        cancel_check: Callable[[], bool] | None = None,
     ):
         if batch_size < 1:
             raise ValueError("batch_size must be positive")
@@ -58,6 +61,8 @@ class FoundryEmbeddingProvider:
         self.store = SQLiteStore(Path(cache_dir) / "rag.sqlite3")
         self.dimension = self.store.get_model_dimension(self.model_key)
         self.batch_size = batch_size
+        self.progress_callback = progress_callback
+        self.cancel_check = cancel_check
         self._closed = False
 
     @staticmethod
@@ -105,14 +110,21 @@ class FoundryEmbeddingProvider:
                 missing_by_key.setdefault(key, text)
 
         missing_items = list(missing_by_key.items())
-        generated: dict[str, list[float]] = {}
+        completed_count = len(keys) - len(missing_items)
+        progress_callback = getattr(self, "progress_callback", None)
+        cancel_check = getattr(self, "cancel_check", None)
+        if progress_callback:
+            progress_callback(completed_count, len(keys))
         for start in range(0, len(missing_items), self.batch_size):
+            if cancel_check and cancel_check():
+                raise RuntimeError("Indexing cancelled")
             batch = missing_items[start : start + self.batch_size]
             response = self.client.generate_embeddings([text for _, text in batch])
             data = list(getattr(response, "data", []))
             if len(data) != len(batch):
                 raise RuntimeError("Embedding model returned an unexpected number of vectors")
 
+            batch_generated: dict[str, list[float]] = {}
             for (key, _), item in zip(batch, data, strict=True):
                 vector = [float(value) for value in item.embedding]
                 self._validate_vector(vector)
@@ -120,13 +132,16 @@ class FoundryEmbeddingProvider:
                     self.dimension = len(vector)
                 if len(vector) != self.dimension:
                     raise RuntimeError("Embedding model returned inconsistent vector dimensions")
-                generated[key] = vector
-
-        if generated:
+                batch_generated[key] = vector
             if self.dimension is None:
                 raise RuntimeError("Embedding model returned no vector dimension")
-            self.store.put_embeddings(self.model_key, self.dimension, generated)
-            cached.update(generated)
+            # Persist each completed batch so cancellation or a later failure can
+            # resume instead of regenerating all prior vectors.
+            self.store.put_embeddings(self.model_key, self.dimension, batch_generated)
+            cached.update(batch_generated)
+            completed_count += len(batch)
+            if progress_callback:
+                progress_callback(min(completed_count, len(keys)), len(keys))
 
         vectors = [cached[key] for key in keys]
         if vectors and self.dimension is None:
@@ -170,9 +185,17 @@ def optional_foundry_embedder(
     model_alias: str,
     download: bool = False,
     cache_dir: str | Path = ".rag_cache",
+    progress_callback: Callable[[int, int], None] | None = None,
+    cancel_check: Callable[[], bool] | None = None,
 ):
     try:
-        return FoundryEmbeddingProvider(model_alias, download, cache_dir)
+        return FoundryEmbeddingProvider(
+            model_alias,
+            download,
+            cache_dir,
+            progress_callback=progress_callback,
+            cancel_check=cancel_check,
+        )
     except (ImportError, EmbeddingUnavailableError) as exc:
         if download:
             raise

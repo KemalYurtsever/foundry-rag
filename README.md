@@ -2,7 +2,11 @@
 
 This is a local, keyless RAG project with structure-aware ingestion, recursive chunking, Unicode-aware BM25 retrieval, optional Foundry Local embeddings, reciprocal-rank fusion, semantic and intent reranking, confidence-based abstention, grounded citations, and regression evaluation. Extracted sections, file hashes, model metadata, and embeddings are persisted transactionally in SQLite.
 
-Supported document types are `.txt`, `.md`, `.pdf`, `.docx`, and legacy `.doc`. Documents are split recursively at paragraph, line, sentence, word, and character boundaries. Chunk size and overlap adapt to each document, retrieval count adapts to the model context window, and response length uses the selected model's advertised output limit. `--chunk-size`, `--overlap`, and `--top-k` are available only when you want explicit overrides. Legacy `.doc` extraction uses an installed copy of Microsoft Word; the other formats do not require Word.
+Supported document types are `.txt`, `.md`, `.pdf`, `.docx`, legacy `.doc`, `.pptx`, and legacy `.ppt`. PowerPoint presentations are extracted and cited slide by slide. Documents are split recursively at paragraph, line, sentence, word, and character boundaries. Chunk size and overlap adapt to each document, retrieval count adapts to the model context window, and response length uses the selected model's advertised output limit. `--chunk-size`, `--overlap`, and `--top-k` are available only when you want explicit overrides. Legacy `.doc` and `.ppt` extraction use installed copies of Microsoft Word and PowerPoint respectively; modern `.docx` and `.pptx` files do not require Office.
+
+## Project presentation
+
+[Watch the Foundry Local RAG presentation on YouTube](https://www.youtube.com/watch?v=NHJ2ffBocgg).
 
 ## Install and test
 
@@ -75,4 +79,15 @@ Launch the graphical application:
 ```
 
 Use **Import files** to add TXT, Markdown, PDF, DOCX, or DOC files. The application copies them into `data/documents`, rebuilds the index in a background thread, and displays verified answers and source filenames/pages in the chat.
+
+The desktop app also provides Precise, Balanced, Thorough, and Custom retrieval profiles; a retrieval inspector; direct evidence views; incremental cached indexing with progress and cancellation; searchable/sortable multi-select file management; persistent settings; and dark/light themes. Double-click a knowledge file to open the original document.
+
+Keyboard shortcuts:
+
+- `Ctrl+O`: import files
+- `Ctrl+L`: focus the question box
+- `Ctrl+K`: show or hide knowledge files
+- `Ctrl+Shift+I`: inspect the last retrieval
+- `F5`: update the index
+- `Escape`: cancel an active index update
 
