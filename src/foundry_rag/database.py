@@ -77,7 +77,9 @@ class SQLiteStore:
                     ON document_sections(collection, source);
                 """
             )
-            connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            # SQLite does not support parameters in PRAGMA assignments. Keep
+            # this statement fully static; no runtime or user value enters SQL.
+            connection.execute("PRAGMA user_version = 1")
 
     def get_document_sections(
         self, collection: str, source: str, sha256: str
@@ -159,6 +161,8 @@ class SQLiteStore:
         with self._connect() as connection:
             for start in range(0, len(unique_hashes), _SQLITE_VARIABLE_LIMIT):
                 batch = unique_hashes[start : start + _SQLITE_VARIABLE_LIMIT]
+                # Only parameter markers are generated here. Every value,
+                # including model aliases and hashes, remains a bound parameter.
                 placeholders = ",".join("?" for _ in batch)
                 rows = connection.execute(
                     f"""

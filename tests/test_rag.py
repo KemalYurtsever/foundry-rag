@@ -39,6 +39,62 @@ class RAGTests(unittest.TestCase):
         chunks = chunk_text("x" * 125, "solid.txt", chunk_size=50, overlap=10)
         self.assertEqual([len(chunk.text) for chunk in chunks], [50, 50, 45])
 
+    def test_numbered_sections_are_chunked_without_crossing_headings(self):
+        text = (
+            "Preamble material.\n\n"
+            "1.Scope\n\n"
+            "1.1 System Scope\n\ncombat\n\ncrafting\n\n"
+            "2.2 Content Scope\n\nThe amount of world and assets.\n\nmap size\n\ncities\n\n"
+            "2.3 Technical Scope\n\nArchitecture complexity.\n\nsharding"
+        )
+        chunks = chunk_text(text, "design.docx")
+
+        self.assertEqual(
+            [chunk.heading for chunk in chunks],
+            [None, "1.1 System Scope", "2.2 Content Scope", "2.3 Technical Scope"],
+        )
+        self.assertFalse(any("Content Scope" in chunk.text and "Technical Scope" in chunk.text for chunk in chunks))
+
+    def test_specific_scope_question_stops_at_next_sibling(self):
+        text = (
+            "1.Scope\n\n"
+            "1.1 System Scope\n\ncombat\n\ncrafting\n\n"
+            "2.2 Content Scope\n\nThe amount of world and assets.\n\nExamples:\n\n"
+            "map size\n\nnumber of enemies\n\nnumber of items\n\nquests\n\ndungeons\n\ncities\n\n"
+            "2.3 Technical Scope\n\nArchitecture complexity.\n\nsharding\n\n"
+            "2.4 Player Capacity Scope\n\nInstead of 1000 players in one area go for 50-100 players in one zone\n\n"
+            "2.5 Art Production Scope\n\ncharacter model\n\ntextures\n\n"
+            "2.6 Infrastructure Scope\n\nserver hosting\n\ndatabase\n\n"
+            "Development order:\n1 infrastructure\n2 networking\n5 content"
+        )
+        chunks = chunk_text(text, "Arsenios Online.docx")
+        pipeline = RAGPipeline(HybridRetriever(chunks))
+
+        content_answer = pipeline.ask("What about the content scope?", top_k=10)
+        self.assertIn("2.2 Content Scope", content_answer.text)
+        self.assertIn("cities", content_answer.text)
+        self.assertNotIn("2.3 Technical Scope", content_answer.text)
+        self.assertNotIn("2.4 Player Capacity Scope", content_answer.text)
+        self.assertNotIn("5 content", content_answer.text)
+
+        overall_answer = pipeline.ask("Tell me about the scope", top_k=10)
+        for heading in (
+            "1.1 System Scope",
+            "2.2 Content Scope",
+            "2.3 Technical Scope",
+            "2.4 Player Capacity Scope",
+            "2.5 Art Production Scope",
+            "2.6 Infrastructure Scope",
+        ):
+            self.assertIn(heading, overall_answer.text)
+        self.assertNotIn("Development order", overall_answer.text)
+        development_chunks = [
+            chunk for chunk in chunks if chunk.heading == "Development order:"
+        ]
+        self.assertEqual(len(development_chunks), 1)
+        self.assertIn("5 content", development_chunks[0].text)
+        self.assertFalse(any(chunk.heading == "5 content" for chunk in chunks))
+
     def test_response_budget_is_bounded_by_model_limit(self):
         generator = object.__new__(FoundryLocalGenerator)
         generator.max_output_tokens = 300
@@ -150,6 +206,45 @@ class RAGTests(unittest.TestCase):
             store.put_embeddings("model", 2, {"first": [1.0, 0.0]})
             with self.assertRaises(ValueError):
                 store.put_embeddings("model", 3, {"second": [1.0, 0.0, 0.0]})
+
+    def test_document_database_treats_injection_payloads_as_data(self):
+        payloads = (
+            "x'); DROP TABLE document_files; --",
+            "x'; DELETE FROM document_sections; --",
+            "' OR 1=1 --",
+            '"; UPDATE document_files SET sha256 = \'owned\'; --',
+        )
+        with tempfile.TemporaryDirectory() as folder:
+            store = SQLiteStore(Path(folder) / "rag.sqlite3")
+            for index, payload in enumerate(payloads):
+                with self.subTest(payload=payload):
+                    digest = f"digest-{index}"
+                    store.put_document_sections(payload, payload, digest, [(payload, None)])
+                    self.assertEqual(
+                        store.get_document_sections(payload, payload, digest),
+                        [(payload, None)],
+                    )
+            self.assertEqual(store.counts()["documents"], len(payloads))
+            self.assertEqual(store.counts()["sections"], len(payloads))
+
+    def test_embedding_database_treats_injection_payloads_as_data(self):
+        payloads = (
+            "model'; DELETE FROM embeddings; --",
+            "model') OR 1=1 --",
+            "model; DROP TABLE embedding_models; --",
+            'model" /* injected comment */',
+        )
+        with tempfile.TemporaryDirectory() as folder:
+            store = SQLiteStore(Path(folder) / "rag.sqlite3")
+            for index, payload in enumerate(payloads):
+                with self.subTest(payload=payload):
+                    malicious_hash = f"hash-{index}') OR 1=1 --"
+                    store.put_embeddings(payload, 2, {malicious_hash: [1.0, 0.0]})
+                    self.assertEqual(
+                        store.get_embeddings(payload, [malicious_hash]),
+                        {malicious_hash: [1.0, 0.0]},
+                    )
+            self.assertEqual(store.counts()["embeddings"], len(payloads))
 
     @unittest.skipUnless(os.getenv("RAG_INTEGRATION_MODEL"), "set RAG_INTEGRATION_MODEL to test a cached Foundry model")
     def test_real_embedding_model_uses_matching_dimensions(self):

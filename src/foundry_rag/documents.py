@@ -24,6 +24,26 @@ _OFFICE_ACTIVE_CONTENT = (
     "embeddings/",
     "oleobject",
 )
+_NUMBERED_HEADING_RE = re.compile(
+    r"^\s*(\d+(?:\.\d+)*)([.)]|\s+)(?:\s*)(\S.*)$"
+)
+_SECTION_LABEL_EXCLUSIONS = {"example:", "examples:", "note:", "notes:"}
+
+
+def _structured_heading(line: str, *, preceded_by_blank: bool = True) -> bool:
+    stripped = line.strip()
+    numbered = _NUMBERED_HEADING_RE.match(stripped)
+    if numbered:
+        number, delimiter, title = numbered.groups()
+        return "." in number or delimiter in ".)" or title[:1].isupper()
+    return (
+        stripped.casefold() not in _SECTION_LABEL_EXCLUSIONS
+        and preceded_by_blank
+        and stripped.endswith(":")
+        and stripped[:1].isupper()
+        and len(stripped) <= 120
+        and len(stripped.split()) <= 10
+    )
 
 
 def validate_document(path: Path) -> None:
@@ -217,6 +237,37 @@ def _dynamic_chunk_limits(text: str) -> tuple[int, int]:
     return chunk_size, overlap
 
 
+def _numbered_sections(text: str) -> list[tuple[str, str | None]]:
+    """Split at numbered headings while retaining unnumbered preamble text."""
+    lines = text.splitlines(keepends=True)
+    heading_indexes = [
+        index
+        for index, line in enumerate(lines)
+        if _structured_heading(
+            line,
+            preceded_by_blank=index == 0 or not lines[index - 1].strip(),
+        )
+    ]
+    if len(heading_indexes) < 2:
+        return [(text, None)]
+
+    sections: list[tuple[str, str | None]] = []
+    if heading_indexes[0] > 0:
+        preamble = "".join(lines[: heading_indexes[0]]).strip()
+        if preamble:
+            sections.append((preamble, None))
+
+    for position, start in enumerate(heading_indexes):
+        end = heading_indexes[position + 1] if position + 1 < len(heading_indexes) else len(lines)
+        section_text = "".join(lines[start:end]).strip()
+        nonempty_lines = [line.strip() for line in section_text.splitlines() if line.strip()]
+        # A parent heading with no direct body is represented by its children.
+        if len(nonempty_lines) < 2:
+            continue
+        sections.append((section_text, nonempty_lines[0]))
+    return sections or [(text, None)]
+
+
 def chunk_text(
     text: str,
     source: str,
@@ -227,34 +278,35 @@ def chunk_text(
     start_position: int = 1,
 ) -> list[Chunk]:
     """Split text on semantic boundaries while preserving punctuation."""
-    dynamic_size, dynamic_overlap = _dynamic_chunk_limits(text)
-    resolved_size = dynamic_size if chunk_size is None else chunk_size
-    resolved_overlap = dynamic_overlap if overlap is None else overlap
-
-    if resolved_size <= 0:
-        raise ValueError("chunk_size must be positive")
-    if resolved_overlap < 0 or resolved_size <= resolved_overlap:
-        raise ValueError("chunk_size must be greater than overlap, and overlap cannot be negative")
-
-    pieces = _recursive_split(
-        text,
-        ("\n\n", "\n", ". ", "? ", "! ", "; ", ", ", " ", ""),
-        resolved_size,
-        resolved_overlap,
-    )
-
     chunks: list[Chunk] = []
-    for offset, piece in enumerate(pieces):
-        position = start_position + offset
-        chunks.append(
-            Chunk(
-                id=_stable_chunk_id(source, position, page, piece),
-                source=source,
-                text=piece,
-                page=page,
-                heading=heading,
-            )
+    position = start_position
+    for section_text, section_heading in _numbered_sections(text):
+        dynamic_size, dynamic_overlap = _dynamic_chunk_limits(section_text)
+        resolved_size = dynamic_size if chunk_size is None else chunk_size
+        resolved_overlap = dynamic_overlap if overlap is None else overlap
+
+        if resolved_size <= 0:
+            raise ValueError("chunk_size must be positive")
+        if resolved_overlap < 0 or resolved_size <= resolved_overlap:
+            raise ValueError("chunk_size must be greater than overlap, and overlap cannot be negative")
+
+        pieces = _recursive_split(
+            section_text,
+            ("\n\n", "\n", ". ", "? ", "! ", "; ", ", ", " ", ""),
+            resolved_size,
+            resolved_overlap,
         )
+        for piece in pieces:
+            chunks.append(
+                Chunk(
+                    id=_stable_chunk_id(source, position, page, piece),
+                    source=source,
+                    text=piece,
+                    page=page,
+                    heading=section_heading or heading,
+                )
+            )
+            position += 1
     return chunks
 
 

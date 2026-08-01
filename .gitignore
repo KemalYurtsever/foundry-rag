@@ -2,7 +2,24 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+# Local environment and secret files must never enter version control.
 .env
+.env.*
+*.env
+*.env.*
+.direnv/
+.envrc
+secrets/
+credentials/
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+service-account*.json
+credentials*.json
+secrets*.json
 .rag_cache/
 *.egg-info/
 build/

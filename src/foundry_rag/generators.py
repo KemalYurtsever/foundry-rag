@@ -364,7 +364,15 @@ def _section_quote(question: str, result: SearchResult) -> str | None:
     end_index = len(lines)
     for index in range(start_index + 1, len(lines)):
         candidate = lines[index].strip()
-        if _NUMBERED_SECTION_RE.match(candidate):
+        unnumbered_heading = (
+            candidate.casefold() not in {"example:", "examples:", "note:", "notes:"}
+            and not lines[index - 1].strip()
+            and candidate.endswith(":")
+            and candidate[:1].isupper()
+            and len(candidate) <= 120
+            and len(candidate.split()) <= 10
+        )
+        if _NUMBERED_SECTION_RE.match(candidate) or unnumbered_heading:
             end_index = index
             break
 
@@ -472,6 +480,30 @@ class ExtractiveGenerator:
                         )
                     )
         if section_candidates:
+            # A specific subsection request such as "content scope" should not
+            # collect every sibling merely because all headings contain "scope".
+            subject_terms = query_terms - {
+                _canonical_term(term) for term in _LIST_REQUEST_TERMS
+            }
+            if subject_terms:
+                exact_subject_candidates = [
+                    item
+                    for item in section_candidates
+                    if subject_terms
+                    <= _canonical_terms(
+                        next(
+                            (
+                                line.strip()
+                                for line in item[1].quote.splitlines()
+                                if line.strip()
+                            ),
+                            "",
+                        )
+                    )
+                ]
+                if exact_subject_candidates:
+                    section_candidates = exact_subject_candidates
+
             numbered_heading_candidates = [
                 item
                 for item in section_candidates
