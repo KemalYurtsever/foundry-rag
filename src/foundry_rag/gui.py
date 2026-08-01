@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import importlib.util
 import logging
-import os
 import re
 import shutil
 import threading
+import uuid
 from collections import Counter
 from dataclasses import replace
 import tkinter as tk
@@ -16,7 +16,7 @@ from tkinter.scrolledtext import ScrolledText
 from tkinterdnd2 import DND_FILES, TkinterDnD
 
 from .app_settings import AppSettings, load_app_settings, save_app_settings
-from .documents import _SUPPORTED_SUFFIXES
+from .documents import _SUPPORTED_SUFFIXES, validate_document
 from .embeddings import optional_foundry_embedder
 from .pipeline import Answer, RAGPipeline, flexible_answer_text
 from .theme import apply_window_frame, theme_palette
@@ -24,8 +24,8 @@ from .ui_support import add_tooltip
 
 LOGGER = logging.getLogger(__name__)
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_DOCUMENTS = PROJECT_ROOT / "data" / "documents"
 DEFAULT_CACHE = PROJECT_ROOT / ".rag_cache"
+DEFAULT_DOCUMENTS = DEFAULT_CACHE / "uploads"
 
 RETRIEVAL_PRESETS: dict[str, tuple[str, int]] = {
     "Precise": ("2", 0),
@@ -53,13 +53,21 @@ def import_documents(paths: tuple[str, ...], destination: Path) -> list[Path]:
         source = Path(raw_path)
         if source.suffix.casefold() not in _SUPPORTED_SUFFIXES:
             continue
+        validate_document(source)
         target = destination / source.name
         counter = 2
         while target.exists() and not source.samefile(target):
             target = destination / f"{source.stem} ({counter}){source.suffix}"
             counter += 1
         if not target.exists():
-            shutil.copy2(source, target)
+            temporary = destination / f".upload-{uuid.uuid4().hex}{source.suffix.lower()}"
+            try:
+                shutil.copyfile(source, temporary)
+                validate_document(temporary)
+                temporary.chmod(0o600)
+                temporary.replace(target)
+            finally:
+                temporary.unlink(missing_ok=True)
         imported.append(target)
     return imported
 
@@ -243,7 +251,6 @@ class RAGDesktopApp(TkinterDnD.Tk):
         self.sidebar.columnconfigure(0, weight=1)
         self.document_list = tk.Listbox(self.sidebar, width=34, selectmode=tk.EXTENDED, activestyle="none", background=THEME["field"], foreground=THEME["text"], selectbackground=THEME["selection"], selectforeground="#ffffff", highlightthickness=1, highlightbackground=THEME["border"], highlightcolor=THEME["accent"], relief=tk.FLAT, borderwidth=0)
         self.document_list.grid(row=0, column=0, sticky="nsew")
-        self.document_list.bind("<Double-Button-1>", self._open_selected_document)
         self.document_list.bind("<<ListboxSelect>>", self._update_document_metadata)
         scrollbar = ttk.Scrollbar(
             self.sidebar, orient=tk.VERTICAL, command=self.document_list.yview
@@ -536,7 +543,7 @@ class RAGDesktopApp(TkinterDnD.Tk):
         paths = filedialog.askopenfilenames(
             title="Import knowledge files",
             filetypes=[
-                ("Supported documents", "*.txt *.md *.pdf *.docx *.doc *.pptx *.ppt"),
+                ("Supported documents", "*.txt *.md *.pdf *.docx *.pptx"),
                 ("All files", "*.*"),
             ],
         )
@@ -786,21 +793,11 @@ class RAGDesktopApp(TkinterDnD.Tk):
             else:
                 messages.append("PDF support: ok")
 
-        if any(suffix in suffixes for suffix in {".doc", ".docx"}):
+        if ".docx" in suffixes:
             messages.append("DOCX support: ok")
-        if ".doc" in suffixes:
-            if os.name != "nt":
-                messages.append("Legacy .doc support unavailable on this OS; convert .doc files to .docx.")
-            else:
-                messages.append("Legacy .doc support requires Microsoft Word installed locally.")
 
         if ".pptx" in suffixes:
             messages.append("PowerPoint PPTX support: ok")
-        if ".ppt" in suffixes:
-            if os.name != "nt":
-                messages.append("Legacy .ppt support unavailable on this OS; convert .ppt files to .pptx.")
-            else:
-                messages.append("Legacy .ppt support requires Microsoft PowerPoint installed locally.")
 
         ocr_modules = all(
             importlib.util.find_spec(module) is not None
@@ -867,7 +864,7 @@ class RAGDesktopApp(TkinterDnD.Tk):
     def _import_selected_paths(self, paths: tuple[str, ...]) -> None:
         try:
             imported = import_documents(paths, self.documents_dir)
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
             messagebox.showerror("Import failed", str(exc), parent=self)
             return
         if not imported:
@@ -889,19 +886,6 @@ class RAGDesktopApp(TkinterDnD.Tk):
             messagebox.showerror("Invalid file", "The selected path is not safe.", parent=self)
             return None
         return target
-
-    def _open_selected_document(self, _event: tk.Event | None = None) -> None:
-        target = self._selected_document_path()
-        if target is None:
-            return
-        if not target.is_file():
-            messagebox.showwarning("Missing file", "The selected file no longer exists.", parent=self)
-            self._refresh_document_list()
-            return
-        try:
-            os.startfile(target)
-        except OSError as exc:
-            messagebox.showwarning("Open file failed", str(exc), parent=self)
 
     def _refresh_selected_document(self) -> None:
         target = self._selected_document_path()
@@ -1375,7 +1359,6 @@ class RAGDesktopApp(TkinterDnD.Tk):
         header.columnconfigure(0, weight=1)
         ttk.Label(header, text=source, font=("Segoe UI", 11, "bold")).grid(row=0, column=0, sticky="w")
         ttk.Label(header, text=str(source_path), style="Subtle.TLabel").grid(row=1, column=0, sticky="w", pady=(2, 0))
-        ttk.Button(header, text="Open document", command=lambda: os.startfile(source_path) if source_path.exists() else None).grid(row=0, column=1, rowspan=2, sticky="e")
 
         controls = ttk.Frame(window, padding=(12, 0, 12, 8))
         controls.grid(row=1, column=0, sticky="ew")

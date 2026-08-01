@@ -2,7 +2,7 @@
 
 This is a local, keyless RAG project with structure-aware ingestion, recursive chunking, Unicode-aware BM25 retrieval, optional Foundry Local embeddings, reciprocal-rank fusion, semantic and intent reranking, confidence-based abstention, grounded citations, and regression evaluation. Extracted sections, file hashes, model metadata, and embeddings are persisted transactionally in SQLite.
 
-Supported document types are `.txt`, `.md`, `.pdf`, `.docx`, legacy `.doc`, `.pptx`, and legacy `.ppt`. PowerPoint presentations are extracted and cited slide by slide. Documents are split recursively at paragraph, line, sentence, word, and character boundaries. Chunk size and overlap adapt to each document, retrieval count adapts to the model context window, and response length uses the selected model's advertised output limit. `--chunk-size`, `--overlap`, and `--top-k` are available only when you want explicit overrides. Legacy `.doc` and `.ppt` extraction use installed copies of Microsoft Word and PowerPoint respectively; modern `.docx` and `.pptx` files do not require Office.
+Supported document types are `.txt`, `.md`, `.pdf`, `.docx`, and `.pptx`. PowerPoint presentations are extracted and cited slide by slide. Documents are split recursively at paragraph, line, sentence, word, and character boundaries. Chunk size and overlap adapt to each document, retrieval count adapts to the model context window, and response length uses the selected model's advertised output limit. `--chunk-size`, `--overlap`, and `--top-k` are available only when you want explicit overrides. Uploaded files are limited to 50 MB, validated by content, and stored with restrictive permissions in the private `.rag_cache/uploads` directory. Office packages are also checked for decompression abuse; packages containing macros, ActiveX, or embedded OLE content are rejected. The app never launches uploaded documents in Office, a browser, or another associated application. Legacy `.doc` and `.ppt` are intentionally unsupported because safely extracting them would require launching Microsoft Office on untrusted files.
 
 ## Project presentation
 
@@ -65,7 +65,7 @@ $env:RAG_INTEGRATION_MODEL="EMBEDDING_MODEL_ALIAS"
 ## Structure
 
 ```text
-data/documents/       knowledge files
+.rag_cache/uploads/   private managed knowledge files
 src/foundry_rag/      ingestion, retrieval, Foundry generation, pipeline, CLI
 tests/                unit and end-to-end smoke tests
 ```
@@ -78,9 +78,9 @@ Launch the graphical application:
 .\.venv\Scripts\python.exe app.py
 ```
 
-Use **Import files** to add TXT, Markdown, PDF, DOCX, or DOC files. The application copies them into `data/documents`, rebuilds the index in a background thread, and displays verified answers and source filenames/pages in the chat.
+Use **Import files** to add TXT, Markdown, PDF, DOCX, or PPTX files. The application validates and copies them into the private `.rag_cache/uploads` store, rebuilds the index in a background thread, and displays verified answers and source filenames/pages in the chat.
 
-The desktop app also provides Precise, Balanced, Thorough, and Custom retrieval profiles; a retrieval inspector; direct evidence views; incremental cached indexing with progress and cancellation; searchable/sortable multi-select file management; persistent settings; and dark/light themes. Double-click a knowledge file to open the original document.
+The desktop app also provides Precise, Balanced, Thorough, and Custom retrieval profiles; a retrieval inspector; direct evidence views; incremental cached indexing with progress and cancellation; searchable/sortable multi-select file management; persistent settings; and dark/light themes. Uploaded documents are never handed to an external application.
 
 Keyboard shortcuts:
 
