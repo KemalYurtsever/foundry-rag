@@ -28,7 +28,7 @@ Pass a model alias from your Foundry Local catalog. `--download` downloads it on
 .\.venv\Scripts\python.exe rag.py --model MODEL_ALIAS --download "What does RAG do?"
 ```
 
-After the first download, omit `--download`. The SDK loads the model in-process and creates its chat client directlyâ€”there are no API keys or environment variables.
+After the first download, omit `--download`. The SDK loads the model in-process and creates its chat client directly, there are no API keys or environment variables.
 
 ## Hybrid retrieval
 
